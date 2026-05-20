@@ -340,7 +340,7 @@ fn get_day_summary_inline(date: &str, content: &str) -> Option<String> {
     if let Some(d) = diff_val {
         parts.push(format!("Diff: {}", d));
     }
-    Some(format!("{}\n\n", parts.join("  │  ")))
+    Some(format!("{}", parts.join("  │  ")))
 }
 
 fn run_klog_for_tag(tag: &str, content: &str) -> Option<String> {
@@ -658,7 +658,7 @@ fn main() {
                             let mut lenses = Vec::new();
 
                             if let Some(content) = documents.get(&uri) {
-                                // Project breakdown at line 0
+                                // Project breakdown at line 0 with 2 trailing blank lines
                                 if let Some(breakdown) = get_project_breakdown(content) {
                                     lenses.push(CodeLens {
                                         range: Range {
@@ -666,23 +666,25 @@ fn main() {
                                             end: Position { line: 0, character: 0 },
                                         },
                                         command: Some(CommandInfo {
-                                            title: breakdown,
+                                            title: format!("{}\n\n", breakdown),
                                             command: "".to_string(),
                                         }),
                                     });
                                 }
 
-                                // One compact day summary above each date line
+                                // One compact day summary below each date line
+                                let total_lines = content.lines().count();
                                 for (idx, line) in content.lines().enumerate() {
                                     if is_date_line(line) {
                                         if let Some(date) = line.trim_start().split_whitespace().next() {
                                             let clean = date.trim_matches(|c: char| !c.is_ascii_digit() && c != '-' && c != '/');
                                             if clean.len() >= 10 {
                                                 if let Some(summary) = get_day_summary_inline(clean, content) {
+                                                    let target_line = if idx + 1 < total_lines { idx + 1 } else { idx };
                                                     lenses.push(CodeLens {
                                                         range: Range {
-                                                            start: Position { line: idx as u32, character: 0 },
-                                                            end: Position { line: idx as u32, character: 0 },
+                                                            start: Position { line: target_line as u32, character: 0 },
+                                                            end: Position { line: target_line as u32, character: 0 },
                                                         },
                                                         command: Some(CommandInfo {
                                                             title: summary,
@@ -715,11 +717,11 @@ fn main() {
                             let mut hints = Vec::new();
 
                             if let Some(content) = documents.get(&uri) {
-                                // Project breakdown at line 0
+                                // Project breakdown at line 0 with 2 trailing blank lines
                                 if let Some(breakdown) = get_project_breakdown(content) {
                                     hints.push(InlayHint {
                                         position: Position { line: 0, character: 0 },
-                                        label: breakdown,
+                                        label: format!("{}\n\n", breakdown),
                                         kind: Some(1),
                                         padding_left: Some(false),
                                         padding_right: Some(true),
