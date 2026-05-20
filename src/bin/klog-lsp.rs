@@ -340,7 +340,7 @@ fn get_day_summary_inline(date: &str, content: &str) -> Option<String> {
     if let Some(d) = diff_val {
         parts.push(format!("Diff: {}", d));
     }
-    Some(parts.join("  │  "))
+    Some(format!("{}\n\n", parts.join("  │  ")))
 }
 
 fn run_klog_for_tag(tag: &str, content: &str) -> Option<String> {
