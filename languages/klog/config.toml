@@ -1,0 +1,4 @@
+name = "klog"
+grammar = "klog"
+path_suffixes = ["klg", "klog"]
+line_comments = ["# "]

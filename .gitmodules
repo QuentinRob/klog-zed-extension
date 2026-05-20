@@ -1,0 +1,3 @@
+[submodule "grammars/klog"]
+	path = grammars/klog
+	url = https://github.com/Ansimorph/tree-sitter-klog

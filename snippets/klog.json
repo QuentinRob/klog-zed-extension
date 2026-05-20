@@ -1,0 +1,46 @@
+{
+    "Current date (date)": {
+        "prefix": "date",
+        "body": "$CURRENT_YEAR-$CURRENT_MONTH-$CURRENT_DATE"
+    },
+    "Current date (20)": {
+        "prefix": "20",
+        "body": "$CURRENT_YEAR-$CURRENT_MONTH-$CURRENT_DATE"
+    },
+    "Record": {
+        "prefix": "record",
+        "body": [
+            "$CURRENT_YEAR-$CURRENT_MONTH-$CURRENT_DATE",
+            "${1:Summary}",
+            "    $0"
+        ]
+    },
+    "Current time": {
+        "prefix": "time",
+        "body": "${1:$CURRENT_HOUR}:${2:$CURRENT_MINUTE}"
+    },
+    "Timespan (ts)": {
+        "prefix": "ts",
+        "body": "${1:$CURRENT_HOUR}:${2:$CURRENT_MINUTE} - ${3:$CURRENT_HOUR}:${4:$CURRENT_MINUTE} $0"
+    },
+    "Timespan (timespan)": {
+        "prefix": "timespan",
+        "body": "${1:$CURRENT_HOUR}:${2:$CURRENT_MINUTE} - ${3:$CURRENT_HOUR}:${4:$CURRENT_MINUTE} $0"
+    },
+    "Timespan Open-ended (tsoe)": {
+        "prefix": "tsoe",
+        "body": "${1:$CURRENT_HOUR}:${2:$CURRENT_MINUTE} - ? $0"
+    },
+    "Timespan Open-ended (timespan-open-ended)": {
+        "prefix": "timespan-open-ended",
+        "body": "${1:$CURRENT_HOUR}:${2:$CURRENT_MINUTE} - ? $0"
+    },
+    "Should-total (st)": {
+        "prefix": "st",
+        "body": "(${1:duration}!)"
+    },
+    "Should-total (shouldtotal)": {
+        "prefix": "shouldtotal",
+        "body": "(${1:duration}!)"
+    }
+}

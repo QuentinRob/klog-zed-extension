@@ -1,0 +1,37 @@
+[
+    {
+        "label": "klog: Total Time",
+        "command": "klog total \"$ZED_FILE\"",
+        "use_new_terminal": false
+    },
+    {
+        "label": "klog: Report",
+        "command": "klog report \"$ZED_FILE\"",
+        "use_new_terminal": false
+    },
+    {
+        "label": "klog: Today",
+        "command": "klog today \"$ZED_FILE\"",
+        "use_new_terminal": false
+    },
+    {
+        "label": "klog: Tags",
+        "command": "klog tags \"$ZED_FILE\"",
+        "use_new_terminal": false
+    },
+    {
+        "label": "klog: Pretty Print",
+        "command": "klog print \"$ZED_FILE\"",
+        "use_new_terminal": false
+    },
+    {
+        "label": "klog: Start Open-Ended Range",
+        "command": "klog start \"$ZED_FILE\"",
+        "use_new_terminal": false
+    },
+    {
+        "label": "klog: Stop Open-Ended Range",
+        "command": "klog stop \"$ZED_FILE\"",
+        "use_new_terminal": false
+    }
+]
