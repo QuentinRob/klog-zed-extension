@@ -12,7 +12,7 @@
 
 ### Syntax Highlighting
 
-Full Tree-sitter–based syntax highlighting for `.klog` and `.klg` files:
+Full syntax highlighting for `.klog` and `.klg` files powered by the [tree-sitter-klog](https://github.com/Ansimorph/tree-sitter-klog) grammar:
 
 - Date headers (`2026-05-20`) and should-total annotations (`(8h!)`)
 - Entry types: timespans (`9:00 - 10:30`), open-ended ranges (`9:00 - ?`), durations (`+1h30m`, `-30m`)
@@ -81,10 +81,7 @@ When your file contains `#project=Value` tags, an inline breakdown appears at th
 Total          │ 5h
 ```
 
-> **Note:** Enable inlay hints or code lenses in your Zed settings to see this:
-> ```json
-> { "inlay_hints": { "enabled": true } }
-> ```
+> **Note:** Code Lens and Inlay Hints must be enabled in your Zed settings. See [Zed Settings](#zed-settings) below.
 
 ### Zed Tasks
 
@@ -159,6 +156,76 @@ Sprint planning + focused work #coding #project=Alpha
 - **Hover** `#coding` → tag time breakdown table
 - **Hover** `#project=Alpha` → project-specific breakdown
 - **Line 0 inline hint** → total time per project value
+
+---
+
+## Zed Settings
+
+The inline project breakdown is surfaced via two complementary LSP features. Enable the one that suits your workflow in your Zed `settings.json` (`⌘⇧P` → **zed: open settings**).
+
+### Code Lens
+
+Displays the project breakdown as a clickable annotation **above** the first line of the file, in the gutter area.
+
+```jsonc
+// settings.json
+{
+  "code_lens": "on"   // "on" | "off"
+}
+```
+
+> You can also toggle Code Lens per-language to keep it scoped to klog files only:
+> ```jsonc
+> {
+>   "languages": {
+>     "klog": {
+>       "code_lens": "on"
+>     }
+>   }
+> }
+> ```
+
+### Inlay Hints
+
+Displays the project breakdown as **inline ghost text** directly inside the editor buffer at the start of the first line.
+
+```jsonc
+// settings.json
+{
+  "inlay_hints": {
+    "enabled": true
+  }
+}
+```
+
+> Scope it to klog files only:
+> ```jsonc
+> {
+>   "languages": {
+>     "klog": {
+>       "inlay_hints": {
+>         "enabled": true
+>       }
+>     }
+>   }
+> }
+> ```
+
+### Recommended: enable both
+
+```jsonc
+// settings.json
+{
+  "languages": {
+    "klog": {
+      "code_lens": "on",
+      "inlay_hints": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
 
 ---
 
