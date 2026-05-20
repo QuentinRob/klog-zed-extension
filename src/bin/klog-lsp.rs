@@ -312,6 +312,37 @@ fn run_klog_for_date(date: &str, content: &str) -> Option<String> {
     Some(table)
 }
 
+/// Returns a compact single-line day summary for use in Code Lenses and Inlay Hints.
+/// Example: "Total: 6h  │  Should: 8h!  │  Diff: -2h"
+fn get_day_summary_inline(date: &str, content: &str) -> Option<String> {
+    let args = vec!["total", "--date", date, "--diff", "--no-style"];
+    let output = run_klog_command(&args, content)?;
+
+    let mut total_val = None;
+    let mut should_val = None;
+    let mut diff_val = None;
+
+    for line in output.lines() {
+        if let Some(v) = line.strip_prefix("Total:") {
+            total_val = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Should:") {
+            should_val = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Diff:") {
+            diff_val = Some(v.trim().to_string());
+        }
+    }
+
+    let total = total_val?;
+    let mut parts = vec![format!("Total: {}", total)];
+    if let Some(s) = should_val {
+        parts.push(format!("Should: {}", s));
+    }
+    if let Some(d) = diff_val {
+        parts.push(format!("Diff: {}", d));
+    }
+    Some(parts.join("  │  "))
+}
+
 fn run_klog_for_tag(tag: &str, content: &str) -> Option<String> {
     let total_args = vec!["total", "--tag", tag, "--no-style"];
     let total_output = run_klog_command(&total_args, content);
@@ -627,6 +658,7 @@ fn main() {
                             let mut lenses = Vec::new();
 
                             if let Some(content) = documents.get(&uri) {
+                                // Project breakdown at line 0
                                 if let Some(breakdown) = get_project_breakdown(content) {
                                     lenses.push(CodeLens {
                                         range: Range {
@@ -638,6 +670,29 @@ fn main() {
                                             command: "".to_string(),
                                         }),
                                     });
+                                }
+
+                                // One compact day summary above each date line
+                                for (idx, line) in content.lines().enumerate() {
+                                    if is_date_line(line) {
+                                        if let Some(date) = line.trim_start().split_whitespace().next() {
+                                            let clean = date.trim_matches(|c: char| !c.is_ascii_digit() && c != '-' && c != '/');
+                                            if clean.len() >= 10 {
+                                                if let Some(summary) = get_day_summary_inline(clean, content) {
+                                                    lenses.push(CodeLens {
+                                                        range: Range {
+                                                            start: Position { line: idx as u32, character: 0 },
+                                                            end: Position { line: idx as u32, character: 0 },
+                                                        },
+                                                        command: Some(CommandInfo {
+                                                            title: summary,
+                                                            command: "".to_string(),
+                                                        }),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -660,14 +715,38 @@ fn main() {
                             let mut hints = Vec::new();
 
                             if let Some(content) = documents.get(&uri) {
+                                // Project breakdown at line 0
                                 if let Some(breakdown) = get_project_breakdown(content) {
                                     hints.push(InlayHint {
                                         position: Position { line: 0, character: 0 },
                                         label: breakdown,
-                                        kind: Some(1), // Type hint
+                                        kind: Some(1),
                                         padding_left: Some(false),
                                         padding_right: Some(true),
                                     });
+                                }
+
+                                // One compact day summary at the end of each date line
+                                for (idx, line) in content.lines().enumerate() {
+                                    if is_date_line(line) {
+                                        if let Some(date) = line.trim_start().split_whitespace().next() {
+                                            let clean = date.trim_matches(|c: char| !c.is_ascii_digit() && c != '-' && c != '/');
+                                            if clean.len() >= 10 {
+                                                if let Some(summary) = get_day_summary_inline(clean, content) {
+                                                    hints.push(InlayHint {
+                                                        position: Position {
+                                                            line: idx as u32,
+                                                            character: line.len() as u32,
+                                                        },
+                                                        label: format!("  │  {}", summary),
+                                                        kind: Some(1),
+                                                        padding_left: Some(true),
+                                                        padding_right: Some(false),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
