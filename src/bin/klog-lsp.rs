@@ -276,6 +276,92 @@ fn run_klog_command(args: &[&str], input: &str) -> Option<String> {
     None
 }
 
+fn format_days(days: f64) -> String {
+    let s = format!("{:.2}", days);
+    if s.ends_with(".00") {
+        s[..s.len() - 3].to_string()
+    } else if s.ends_with('0') && s.contains('.') {
+        s[..s.len() - 1].to_string()
+    } else {
+        s
+    }
+}
+
+fn convert_duration_string(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return s.to_string();
+    }
+
+    let has_exclamation = trimmed.ends_with('!');
+    let clean_s = if has_exclamation {
+        &trimmed[..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+
+    let is_negative = clean_s.starts_with('-');
+    let is_positive = clean_s.starts_with('+');
+    let clean_s = if is_negative || is_positive {
+        &clean_s[1..]
+    } else {
+        clean_s
+    };
+
+    let mut hours = 0;
+    let mut minutes = 0;
+    let mut parsed = false;
+
+    if clean_s.contains('h') && clean_s.contains('m') {
+        let parts: Vec<&str> = clean_s.split('h').collect();
+        if parts.len() == 2 {
+            if let Ok(h) = parts[0].parse::<i32>() {
+                let m_str = parts[1].trim_end_matches('m');
+                if let Ok(m) = m_str.parse::<i32>() {
+                    hours = h;
+                    minutes = m;
+                    parsed = true;
+                }
+            }
+        }
+    } else if clean_s.contains('h') {
+        let h_str = clean_s.trim_end_matches('h');
+        if let Ok(h) = h_str.parse::<i32>() {
+            hours = h;
+            parsed = true;
+        }
+    } else if clean_s.contains('m') {
+        let m_str = clean_s.trim_end_matches('m');
+        if let Ok(m) = m_str.parse::<i32>() {
+            minutes = m;
+            parsed = true;
+        }
+    }
+
+    if !parsed {
+        return s.to_string();
+    }
+
+    let total_minutes = hours * 60 + minutes;
+    if total_minutes >= 462 {
+        let days = total_minutes as f64 / 462.0;
+        let mut formatted = format_days(days);
+        if is_negative {
+            formatted = format!("-{}", formatted);
+        } else if is_positive {
+            formatted = format!("+{}", formatted);
+        }
+        formatted.push('d');
+        if has_exclamation {
+            formatted.push('!');
+        }
+        formatted
+    } else {
+        s.to_string()
+    }
+}
+
+
 fn run_klog_for_date(date: &str, content: &str) -> Option<String> {
     let total_args = vec!["total", "--date", date, "--diff", "--no-style"];
     let total_output = run_klog_command(&total_args, content)?;
@@ -300,13 +386,13 @@ fn run_klog_for_date(date: &str, content: &str) -> Option<String> {
     table.push_str("| Metric | Value |\n");
     table.push_str("| :--- | :--- |\n");
     if let Some(v) = &total_val {
-        table.push_str(&format!("| **Total** | **{}** |\n", v));
+        table.push_str(&format!("| **Total** | **{}** |\n", convert_duration_string(v)));
     }
     if let Some(v) = &should_val {
-        table.push_str(&format!("| Should | {} |\n", v));
+        table.push_str(&format!("| Should | {} |\n", convert_duration_string(v)));
     }
     if let Some(v) = &diff_val {
-        table.push_str(&format!("| Diff | {} |\n", v));
+        table.push_str(&format!("| Diff | {} |\n", convert_duration_string(v)));
     }
 
     Some(table)
@@ -333,12 +419,12 @@ fn get_day_summary_inline(date: &str, content: &str) -> Option<String> {
     }
 
     let total = total_val?;
-    let mut parts = vec![format!("Total: {}", total)];
+    let mut parts = vec![format!("Total: {}", convert_duration_string(&total))];
     if let Some(s) = should_val {
-        parts.push(format!("Should: {}", s));
+        parts.push(format!("Should: {}", convert_duration_string(&s)));
     }
     if let Some(d) = diff_val {
-        parts.push(format!("Diff: {}", d));
+        parts.push(format!("Diff: {}", convert_duration_string(&d)));
     }
     Some(format!("{}", parts.join("  │  ")))
 }
@@ -415,7 +501,8 @@ fn run_klog_for_tag(tag: &str, content: &str) -> Option<String> {
             }
 
             let date_label = format!("{} {} {}", cur_year, cur_month, day);
-            table.push_str(&format!("| {} | {} |\n", date_label.trim(), time));
+            let time_converted = convert_duration_string(time);
+            table.push_str(&format!("| {} | {} |\n", date_label.trim(), time_converted));
         }
     }
 
@@ -423,7 +510,7 @@ fn run_klog_for_tag(tag: &str, content: &str) -> Option<String> {
     if let Some(total) = total_output {
         if let Some(line) = total.lines().find(|l| l.starts_with("Total:")) {
             let total_val = line.strip_prefix("Total:").unwrap().trim();
-            table.push_str(&format!("| **Total** | **{}** |\n", total_val));
+            table.push_str(&format!("| **Total** | **{}** |\n", convert_duration_string(total_val)));
         }
     }
 
@@ -455,7 +542,7 @@ fn get_project_aligned_text(content: &str) -> Option<String> {
                     if parts.len() >= 2 {
                         let val_name = parts[0];
                         let val_total = parts[1];
-                        project_values.push((format!("#project={}", val_name), val_total.to_string()));
+                        project_values.push((format!("#project={}", val_name), convert_duration_string(val_total)));
                     }
                 } else {
                     break;
@@ -486,7 +573,7 @@ fn get_project_aligned_text(content: &str) -> Option<String> {
         text_table.push_str(&format!("{:<width$} │ {}\n", name, time, width = max_width));
     }
     if let Some(total) = total_time {
-        text_table.push_str(&format!("{:<width$} │ {}", total_label, total, width = max_width));
+        text_table.push_str(&format!("{:<width$} │ {}", total_label, convert_duration_string(&total), width = max_width));
     }
 
     Some(text_table)
@@ -513,7 +600,7 @@ fn get_project_table_report(content: &str) -> Option<String> {
                     if parts.len() >= 2 {
                         let val_name = parts[0];
                         let val_total = parts[1];
-                        project_values.push((val_name.to_string(), val_total.to_string()));
+                        project_values.push((val_name.to_string(), convert_duration_string(val_total)));
                     }
                 } else {
                     break;
@@ -537,7 +624,7 @@ fn get_project_table_report(content: &str) -> Option<String> {
     }
 
     if let Some(total) = total_time {
-        table.push_str(&format!("| **Total** | **{}** |\n", total));
+        table.push_str(&format!("| **Total** | **{}** |\n", convert_duration_string(&total)));
     }
 
     Some(table)
