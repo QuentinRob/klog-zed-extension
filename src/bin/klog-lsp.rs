@@ -658,7 +658,7 @@ fn main() {
                             let mut lenses = Vec::new();
 
                             if let Some(content) = documents.get(&uri) {
-                                // Project breakdown at line 0 with 2 trailing blank lines
+                                // Project breakdown at line 0 with 1 trailing blank line
                                 if let Some(breakdown) = get_project_breakdown(content) {
                                     lenses.push(CodeLens {
                                         range: Range {
@@ -666,7 +666,7 @@ fn main() {
                                             end: Position { line: 0, character: 0 },
                                         },
                                         command: Some(CommandInfo {
-                                            title: format!("{}\n\n", breakdown),
+                                            title: format!("{}\n", breakdown),
                                             command: "".to_string(),
                                         }),
                                     });
@@ -717,11 +717,11 @@ fn main() {
                             let mut hints = Vec::new();
 
                             if let Some(content) = documents.get(&uri) {
-                                // Project breakdown at line 0 with 2 trailing blank lines
+                                // Project breakdown at line 0 with 1 trailing blank line
                                 if let Some(breakdown) = get_project_breakdown(content) {
                                     hints.push(InlayHint {
                                         position: Position { line: 0, character: 0 },
-                                        label: format!("{}\n\n", breakdown),
+                                        label: format!("{}\n", breakdown),
                                         kind: Some(1),
                                         padding_left: Some(false),
                                         padding_right: Some(true),
