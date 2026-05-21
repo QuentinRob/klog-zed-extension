@@ -28,11 +28,11 @@ The outline panel (`⌘⇧O`) lists all date records as navigable symbols, makin
 
 | Prefix | Expands to |
 | :--- | :--- |
-| `record` | Full record block with today's date + summary placeholder |
-| `date` / `20` | Today's date (`YYYY-MM-DD`) |
-| `time` | Current time (`HH:MM`) |
-| `ts` / `timespan` | Timespan entry (`HH:MM - HH:MM`) |
-| `tsoe` / `timespan-open-ended` | Open-ended timespan (`HH:MM - ?`) |
+| `record` | Full record block with configurable date, configured day duration target, and summary placeholder (e.g. `2026-05-21 (7h42m!)\nSummary\n    $0`) |
+| `date` / `today` / `20` | Dynamic date (configurable placeholder) with the configured day duration target (e.g. `2026-05-21 (7h42m!)` or `YYYY-MM-DD (7h42m!)`) |
+| `time` | Current dynamic time (e.g. `10:14`) |
+| `ts` / `timespan` | Timespan entry starting at current hour (e.g. `10:00 - 10:00`) |
+| `tsoe` / `timespan-open-ended` | Open-ended timespan starting at current time (e.g. `10:14 - ?`) |
 | `st` / `shouldtotal` | Should-total annotation (`(Xh!)`) |
 
 ### Hover Reports (LSP)
@@ -73,13 +73,23 @@ Hover over any element to get an instant report powered by the `klog` CLI:
 
 ### Inline Project Breakdown (Code Lens / Inlay Hints)
 
-When your file contains `#project=Value` tags, an inline breakdown appears at the very top of the file showing total time per project — no need to open a terminal:
+When your file contains `#project=Value` tags, an inline breakdown appears at the very top of the file showing total time per project alongside an end-of-month projection — no need to open a terminal:
 
 ```
-#project=Alpha │ 1h30m
-#project=Beta  │ 3h30m
-Total          │ 5h
+Project        │ Total │ Est. End
+───────────────┼───────┼──────────
+#project=Alpha │ 1h30m │ 2h19m
+#project=Beta  │ 3h30m │ 5h25m
+───────────────┼───────┼──────────
+Total          │ 5h    │ 7h45m
 ```
+
+The `Est. End` projection for projects is automatically calculated by scaling the tracked time for the current month by the ratio of total days in the month to the day of the latest record:
+$$\text{Estimated Project Total} = \text{Total So Far} \times \frac{T_{\text{total}}}{D_{\text{latest}}}$$
+The estimated grand total for the month, however, is calculated as the number of working days in that month multiplied by the configured day duration:
+$$\text{Estimated Grand Total} = \text{Working Days} \times \text{day\_duration}$$
+Values equal to or exceeding the configured day duration (default `7h42m`) are converted to days (e.g. `1d` for `7h42m`).
+
 
 > **Note:** Code Lens and Inlay Hints must be enabled in your Zed settings. See [Zed Settings](#zed-settings) below.
 
@@ -221,6 +231,23 @@ Displays the project breakdown as **inline ghost text** directly inside the edit
       "code_lens": "on",
       "inlay_hints": {
         "enabled": true
+      }
+    }
+  }
+}
+```
+
+### Day Duration
+
+By default, any duration equal to or exceeding 7 hours and 42 minutes (`7h42m`) is converted and formatted as a day (e.g. `1d` for `7h42m`). You can customize this threshold in your `settings.json` using the `day_duration` option under `initialization_options` for `klog-lsp`:
+
+```jsonc
+// settings.json
+{
+  "lsp": {
+    "klog-lsp": {
+      "initialization_options": {
+        "day_duration": "8h"  // Supports standard klog duration strings (e.g. "8h", "7h30m", "1h30m", "450m") or integers (< 24 for hours, >= 24 for minutes)
       }
     }
   }

@@ -4,6 +4,138 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
 use std::process::Command;
 
+static DAY_DURATION_MINUTES: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(462);
+
+fn get_day_duration_minutes() -> i32 {
+    let val = DAY_DURATION_MINUTES.load(std::sync::atomic::Ordering::Relaxed);
+    if val <= 0 {
+        462
+    } else {
+        val
+    }
+}
+
+/// Parses a duration string that can contain decimals (e.g. "7.7h", "8h", "7h30m", "450m") into total minutes.
+/// Note that floats are not supported by the klog format itself, but are parsed here for configuration convenience.
+/// Also supports bare numbers like "7.5" (hours) or "450" (minutes/hours depending on value).
+fn parse_duration_to_minutes_flexible(s: &str) -> Option<i32> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let has_exclamation = trimmed.ends_with('!');
+    let clean_s = if has_exclamation {
+        &trimmed[..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    let is_negative = clean_s.starts_with('-');
+    let is_positive = clean_s.starts_with('+');
+    let clean_s = if is_negative || is_positive {
+        &clean_s[1..]
+    } else {
+        clean_s
+    };
+
+    let mut total_minutes = 0.0;
+    let mut parsed = false;
+
+    if clean_s.contains('h') && clean_s.contains('m') {
+        let parts: Vec<&str> = clean_s.split('h').collect();
+        if parts.len() == 2 {
+            if let Ok(h) = parts[0].parse::<f64>() {
+                let m_str = parts[1].trim_end_matches('m');
+                if let Ok(m) = m_str.parse::<f64>() {
+                    total_minutes = h * 60.0 + m;
+                    parsed = true;
+                }
+            }
+        }
+    } else if clean_s.contains('h') {
+        let h_str = clean_s.trim_end_matches('h');
+        if let Ok(h) = h_str.parse::<f64>() {
+            total_minutes = h * 60.0;
+            parsed = true;
+        }
+    } else if clean_s.contains('m') {
+        let m_str = clean_s.trim_end_matches('m');
+        if let Ok(m) = m_str.parse::<f64>() {
+            total_minutes = m;
+            parsed = true;
+        }
+    } else {
+        if let Ok(val) = clean_s.parse::<f64>() {
+            if val.fract() == 0.0 {
+                let val_i = val as i32;
+                if val_i < 24 {
+                    total_minutes = val * 60.0;
+                } else {
+                    total_minutes = val;
+                }
+            } else {
+                total_minutes = val * 60.0;
+            }
+            parsed = true;
+        }
+    }
+
+    if parsed {
+        let mins = total_minutes.round() as i32;
+        if is_negative {
+            Some(-mins)
+        } else {
+            Some(mins)
+        }
+    } else {
+        None
+    }
+}
+
+/// Parses a json day_duration value (which could be number or string) into minutes.
+fn parse_day_duration_setting(value: &serde_json::Value) -> Option<i32> {
+    match value {
+        serde_json::Value::Number(num) => {
+            if let Some(f) = num.as_f64() {
+                if f.fract() == 0.0 {
+                    let val = f as i32;
+                    if val < 24 {
+                        Some(val * 60)
+                    } else {
+                        Some(val)
+                    }
+                } else {
+                    Some((f * 60.0).round() as i32)
+                }
+            } else {
+                None
+            }
+        }
+        serde_json::Value::String(s) => parse_duration_to_minutes_flexible(s),
+        _ => None,
+    }
+}
+
+/// Recursively searches for the "day_duration" key in a JSON Value.
+fn find_day_duration_recursively(value: &serde_json::Value) -> Option<serde_json::Value> {
+    if let Some(obj) = value.as_object() {
+        if let Some(val) = obj.get("day_duration") {
+            return Some(val.clone());
+        }
+        for (_, val) in obj {
+            if let Some(res) = find_day_duration_recursively(val) {
+                return Some(res);
+            }
+        }
+    } else if let Some(arr) = value.as_array() {
+        for val in arr {
+            if let Some(res) = find_day_duration_recursively(val) {
+                return Some(res);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct JsonRpcRequest {
     jsonrpc: String,
@@ -343,8 +475,9 @@ fn convert_duration_string(s: &str) -> String {
     }
 
     let total_minutes = hours * 60 + minutes;
-    if total_minutes >= 462 {
-        let days = total_minutes as f64 / 462.0;
+    let day_duration = get_day_duration_minutes();
+    if total_minutes >= day_duration {
+        let days = total_minutes as f64 / day_duration as f64;
         let mut formatted = format_days(days);
         if is_negative {
             formatted = format!("-{}", formatted);
@@ -359,6 +492,275 @@ fn convert_duration_string(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+fn get_current_date() -> Option<String> {
+    let output = Command::new("date")
+        .arg("+%Y-%m-%d")
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn get_current_time() -> Option<String> {
+    let output = Command::new("date")
+        .arg("+%H:%M")
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn get_completions(date_str: &str, time_str: &str) -> serde_json::Value {
+    let hour = if time_str.len() >= 2 { &time_str[..2] } else { "00" };
+    let mins = get_day_duration_minutes();
+    let duration_str = format_minutes_to_duration(mins);
+
+    let date_with_duration = format!("{} ({}!)", date_str, duration_str);
+    let date_snippet_prefilled = format!("${{1:{}}} (${{2:{}!}})", date_str, duration_str);
+    let date_snippet_not_prefilled = format!("${{1:YYYY-MM-DD}} (${{2:{}!}})", duration_str);
+
+    serde_json::json!([
+        {
+            "label": "today",
+            "insertText": date_snippet_prefilled,
+            "insertTextFormat": 2,
+            "kind": 15,
+            "detail": format!("Inserts today's date with configured day duration ({})", date_with_duration)
+        },
+        {
+            "label": "date",
+            "insertText": date_snippet_not_prefilled,
+            "insertTextFormat": 2,
+            "kind": 15,
+            "detail": format!("Inserts a date record template with configured day duration (YYYY-MM-DD ({}!))", duration_str)
+        },
+        {
+            "label": "20",
+            "insertText": date_snippet_prefilled,
+            "insertTextFormat": 2,
+            "kind": 15,
+            "detail": format!("Inserts today's date with configured day duration ({})", date_with_duration)
+        },
+        {
+            "label": date_str,
+            "insertText": date_snippet_prefilled,
+            "insertTextFormat": 2,
+            "kind": 15,
+            "detail": format!("Inserts today's date with configured day duration ({})", date_with_duration)
+        },
+        {
+            "label": "record",
+            "insertText": format!("${{1:{}}} (${{2:{}!}})\n${{3:Summary}}\n    $0", date_str, duration_str),
+            "insertTextFormat": 2,
+            "kind": 15,
+            "detail": "Creates a new record block with today's date and configured day duration"
+        },
+        {
+            "label": "time",
+            "insertText": time_str,
+            "kind": 15,
+            "detail": format!("Inserts current time ({})", time_str)
+        },
+        {
+            "label": "ts",
+            "insertText": format!("{}:${{1:00}} - {}:${{2:00}} $0", hour, hour),
+            "insertTextFormat": 2,
+            "kind": 15,
+            "detail": "Inserts a timespan starting at the current hour"
+        },
+        {
+            "label": "timespan",
+            "insertText": format!("{}:${{1:00}} - {}:${{2:00}} $0", hour, hour),
+            "insertTextFormat": 2,
+            "kind": 15,
+            "detail": "Inserts a timespan starting at the current hour"
+        },
+        {
+            "label": "tsoe",
+            "insertText": format!("{} - ? $0", time_str),
+            "insertTextFormat": 2,
+            "kind": 15,
+            "detail": "Inserts an open-ended timespan starting at the current time"
+        },
+        {
+            "label": "timespan-open-ended",
+            "insertText": format!("{} - ? $0", time_str),
+            "insertTextFormat": 2,
+            "kind": 15,
+            "detail": "Inserts an open-ended timespan starting at the current time"
+        }
+    ])
+}
+
+/// Sakamoto's algorithm: returns 0 for Sunday, 1 for Monday, ..., 6 for Saturday.
+fn day_of_week(y: i32, m: i32, d: i32) -> i32 {
+    let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let mut y = y;
+    if m < 3 {
+        y -= 1;
+    }
+    (y + y / 4 - y / 100 + y / 400 + t[(m - 1) as usize] + d) % 7
+}
+
+/// Returns true if the day is a weekday (Monday through Friday).
+fn is_weekday(y: i32, m: i32, d: i32) -> bool {
+    let dow = day_of_week(y, m, d);
+    dow != 0 && dow != 6
+}
+
+/// Returns the number of working days (weekdays) in the given month of the given year.
+fn working_days_in_month(year: i32, month: i32) -> i32 {
+    let mut working_days = 0;
+    let days = days_in_month(year, month);
+    for d in 1..=days {
+        if is_weekday(year, month, d) {
+            working_days += 1;
+        }
+    }
+    working_days
+}
+
+/// Returns the number of days in the given month of the given year, taking leap years into account.
+fn days_in_month(year: i32, month: i32) -> i32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+/// Scans the entire file content to identify the latest record date.
+/// Returns a tuple of (Year, Month, Day) if any valid dates are found.
+fn find_latest_date_in_content(content: &str) -> Option<(i32, i32, i32)> {
+    let mut latest_date: Option<(i32, i32, i32)> = None;
+    for line in content.lines() {
+        if is_date_line(line) {
+            if let Some(date_part) = line.trim_start().split_whitespace().next() {
+                let clean = date_part.trim_matches(|c: char| !c.is_ascii_digit() && c != '-' && c != '/');
+                let parts: Vec<&str> = if clean.contains('-') {
+                    clean.split('-').collect()
+                } else {
+                    clean.split('/').collect()
+                };
+                if parts.len() == 3 {
+                    if let (Ok(y), Ok(m), Ok(d)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>(), parts[2].parse::<i32>()) {
+                        let cur = (y, m, d);
+                        if let Some(prev) = latest_date {
+                            if cur > prev {
+                                latest_date = Some(cur);
+                            }
+                        } else {
+                            latest_date = Some(cur);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    latest_date
+}
+
+/// Parses a duration string (e.g. "1h30m", "45m", "+2h", "-30m", "8h!") into total minutes.
+fn parse_duration_to_minutes(s: &str) -> Option<i32> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let has_exclamation = trimmed.ends_with('!');
+    let clean_s = if has_exclamation {
+        &trimmed[..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+
+    let is_negative = clean_s.starts_with('-');
+    let is_positive = clean_s.starts_with('+');
+    let clean_s = if is_negative || is_positive {
+        &clean_s[1..]
+    } else {
+        clean_s
+    };
+
+    let mut hours = 0;
+    let mut minutes = 0;
+    let mut parsed = false;
+
+    if clean_s.contains('h') && clean_s.contains('m') {
+        let parts: Vec<&str> = clean_s.split('h').collect();
+        if parts.len() == 2 {
+            if let Ok(h) = parts[0].parse::<i32>() {
+                let m_str = parts[1].trim_end_matches('m');
+                if let Ok(m) = m_str.parse::<i32>() {
+                    hours = h;
+                    minutes = m;
+                    parsed = true;
+                }
+            }
+        }
+    } else if clean_s.contains('h') {
+        let h_str = clean_s.trim_end_matches('h');
+        if let Ok(h) = h_str.parse::<i32>() {
+            hours = h;
+            parsed = true;
+        }
+    } else if clean_s.contains('m') {
+        let m_str = clean_s.trim_end_matches('m');
+        if let Ok(m) = m_str.parse::<i32>() {
+            minutes = m;
+            parsed = true;
+        }
+    }
+
+    if parsed {
+        let total = hours * 60 + minutes;
+        if is_negative {
+            Some(-total)
+        } else {
+            Some(total)
+        }
+    } else {
+        None
+    }
+}
+
+/// Converts total minutes back into a standard klog duration string (e.g. "1h30m", "45m", "-30m").
+fn format_minutes_to_duration(total_mins: i32) -> String {
+    if total_mins == 0 {
+        return "0m".to_string();
+    }
+    let is_negative = total_mins < 0;
+    let total_mins = total_mins.abs();
+    let hours = total_mins / 60;
+    let minutes = total_mins % 60;
+
+    let mut s = String::new();
+    if is_negative {
+        s.push('-');
+    }
+    if hours > 0 && minutes > 0 {
+        s.push_str(&format!("{}h{}m", hours, minutes));
+    } else if hours > 0 {
+        s.push_str(&format!("{}h", hours));
+    } else {
+        s.push_str(&format!("{}m", minutes));
+    }
+    s
 }
 
 
@@ -522,7 +924,17 @@ fn get_project_breakdown(content: &str) -> Option<String> {
 }
 
 fn get_project_aligned_text(content: &str) -> Option<String> {
-    let args = vec!["tags", "--values", "--no-style"];
+    let latest_date = find_latest_date_in_content(content);
+    #[allow(unused_assignments)]
+    let mut period_str = String::new();
+    
+    let (args, days_info) = if let Some((year, month, day)) = latest_date {
+        period_str = format!("{:04}-{:02}", year, month);
+        (vec!["tags", "--values", "--period", &period_str, "--no-style"], Some((year, month, day)))
+    } else {
+        (vec!["tags", "--values", "--no-style"], None)
+    };
+
     let output = run_klog_command(&args, content)?;
 
     let mut lines = output.lines().peekable();
@@ -542,7 +954,7 @@ fn get_project_aligned_text(content: &str) -> Option<String> {
                     if parts.len() >= 2 {
                         let val_name = parts[0];
                         let val_total = parts[1];
-                        project_values.push((format!("#project={}", val_name), convert_duration_string(val_total)));
+                        project_values.push((format!("#project={}", val_name), val_total.to_string()));
                     }
                 } else {
                     break;
@@ -556,31 +968,124 @@ fn get_project_aligned_text(content: &str) -> Option<String> {
         return None;
     }
 
-    let mut max_width = "Project".len();
-    for (name, _) in &project_values {
-        if name.len() > max_width {
-            max_width = name.len();
+    let ratio = if let Some((year, month, _day)) = days_info {
+        if let Some(ref total_str) = total_time {
+            if let Some(total_mins) = parse_duration_to_minutes(total_str) {
+                if total_mins > 0 {
+                    let working_days = working_days_in_month(year, month);
+                    let day_duration = get_day_duration_minutes();
+                    Some((working_days * day_duration) as f64 / total_mins as f64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         }
-    }
-    
-    let total_label = "Total";
-    if total_label.len() > max_width {
-        max_width = total_label.len();
+    } else {
+        None
+    };
+
+    let header_project = "Project";
+    let header_total = "Total";
+    let header_est = "Est. End";
+
+    let mut max_project_width = header_project.len();
+    let mut max_total_width = header_total.len();
+    let mut max_est_width = header_est.len();
+
+    let mut rows = Vec::new();
+    for (name, raw_time) in &project_values {
+        let time_formatted = convert_duration_string(raw_time);
+        let est_formatted = if let Some(r) = ratio {
+            if let Some(mins) = parse_duration_to_minutes(raw_time) {
+                let est_mins = ((mins as f64) * r).round() as i32;
+                convert_duration_string(&format_minutes_to_duration(est_mins))
+            } else {
+                "-".to_string()
+            }
+        } else {
+            "-".to_string()
+        };
+
+        max_project_width = max_project_width.max(name.len());
+        max_total_width = max_total_width.max(time_formatted.len());
+        max_est_width = max_est_width.max(est_formatted.len());
+
+        rows.push((name.clone(), time_formatted, est_formatted));
     }
 
+    let total_label = "Total";
+    let total_time_formatted = if let Some(ref t) = total_time {
+        convert_duration_string(t)
+    } else {
+        "-".to_string()
+    };
+
+    let total_est_formatted = if let Some((year, month, _)) = latest_date {
+        let working_days = working_days_in_month(year, month);
+        let day_duration = get_day_duration_minutes();
+        let est_mins = working_days * day_duration;
+        convert_duration_string(&format_minutes_to_duration(est_mins))
+    } else {
+        "-".to_string()
+    };
+
+    max_project_width = max_project_width.max(total_label.len());
+    max_total_width = max_total_width.max(total_time_formatted.len());
+    max_est_width = max_est_width.max(total_est_formatted.len());
+
     let mut text_table = String::new();
-    for (name, time) in &project_values {
-        text_table.push_str(&format!("{:<width$} │ {}\n", name, time, width = max_width));
+    
+    // Header
+    text_table.push_str(&format!(
+        "{:<col1_w$} │ {:<col2_w$} │ {:<col3_w$}\n",
+        header_project, header_total, header_est,
+        col1_w = max_project_width, col2_w = max_total_width, col3_w = max_est_width
+    ));
+
+    // Separator
+    let sep_col1 = "─".repeat(max_project_width + 1);
+    let sep_col2 = "─".repeat(max_total_width + 2);
+    let sep_col3 = "─".repeat(max_est_width + 1);
+    text_table.push_str(&format!("{}┼{}┼{}\n", sep_col1, sep_col2, sep_col3));
+
+    // Rows
+    for (name, total, est) in rows {
+        text_table.push_str(&format!(
+            "{:<col1_w$} │ {:<col2_w$} │ {:<col3_w$}\n",
+            name, total, est,
+            col1_w = max_project_width, col2_w = max_total_width, col3_w = max_est_width
+        ));
     }
-    if let Some(total) = total_time {
-        text_table.push_str(&format!("{:<width$} │ {}", total_label, convert_duration_string(&total), width = max_width));
+
+    // Total row
+    if total_time.is_some() {
+        text_table.push_str(&format!("{}┼{}┼{}\n", sep_col1, sep_col2, sep_col3));
+        text_table.push_str(&format!(
+            "{:<col1_w$} │ {:<col2_w$} │ {:<col3_w$}",
+            total_label, total_time_formatted, total_est_formatted,
+            col1_w = max_project_width, col2_w = max_total_width, col3_w = max_est_width
+        ));
     }
 
     Some(text_table)
 }
 
 fn get_project_table_report(content: &str) -> Option<String> {
-    let args = vec!["tags", "--values", "--no-style"];
+    let latest_date = find_latest_date_in_content(content);
+    #[allow(unused_assignments)]
+    let mut period_str = String::new();
+    
+    let (args, days_info) = if let Some((year, month, day)) = latest_date {
+        period_str = format!("{:04}-{:02}", year, month);
+        (vec!["tags", "--values", "--period", &period_str, "--no-style"], Some((year, month, day)))
+    } else {
+        (vec!["tags", "--values", "--no-style"], None)
+    };
+
     let output = run_klog_command(&args, content)?;
 
     let mut lines = output.lines().peekable();
@@ -600,7 +1105,7 @@ fn get_project_table_report(content: &str) -> Option<String> {
                     if parts.len() >= 2 {
                         let val_name = parts[0];
                         let val_total = parts[1];
-                        project_values.push((val_name.to_string(), convert_duration_string(val_total)));
+                        project_values.push((val_name.to_string(), val_total.to_string()));
                     }
                 } else {
                     break;
@@ -614,17 +1119,57 @@ fn get_project_table_report(content: &str) -> Option<String> {
         return None;
     }
 
+    let ratio = if let Some((year, month, _day)) = days_info {
+        if let Some(ref total_str) = total_time {
+            if let Some(total_mins) = parse_duration_to_minutes(total_str) {
+                if total_mins > 0 {
+                    let working_days = working_days_in_month(year, month);
+                    let day_duration = get_day_duration_minutes();
+                    Some((working_days * day_duration) as f64 / total_mins as f64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut table = String::new();
     table.push_str("### Project Report\n\n");
-    table.push_str("| Project | Total Time |\n");
-    table.push_str("| :--- | :--- |\n");
+    table.push_str("| Project | Total Time | Est. End |\n");
+    table.push_str("| :--- | :--- | :--- |\n");
 
-    for (name, time) in project_values {
-        table.push_str(&format!("| `#project={}` | {} |\n", name, time));
+    for (name, raw_time) in project_values {
+        let time_formatted = convert_duration_string(&raw_time);
+        let est_formatted = if let Some(r) = ratio {
+            if let Some(mins) = parse_duration_to_minutes(&raw_time) {
+                let est_mins = ((mins as f64) * r).round() as i32;
+                convert_duration_string(&format_minutes_to_duration(est_mins))
+            } else {
+                "-".to_string()
+            }
+        } else {
+            "-".to_string()
+        };
+        table.push_str(&format!("| `#project={}` | {} | {} |\n", name, time_formatted, est_formatted));
     }
 
     if let Some(total) = total_time {
-        table.push_str(&format!("| **Total** | **{}** |\n", convert_duration_string(&total)));
+        let total_formatted = convert_duration_string(&total);
+        let total_est_formatted = if let Some((year, month, _)) = latest_date {
+            let working_days = working_days_in_month(year, month);
+            let day_duration = get_day_duration_minutes();
+            let est_mins = working_days * day_duration;
+            convert_duration_string(&format_minutes_to_duration(est_mins))
+        } else {
+            "-".to_string()
+        };
+        table.push_str(&format!("| **Total** | **{}** | **{}** |\n", total_formatted, total_est_formatted));
     }
 
     Some(table)
@@ -646,6 +1191,14 @@ fn main() {
             log_msg(&format!("Parsed request: {}", req.method));
             match req.method.as_str() {
                 "initialize" => {
+                    if let Some(ref params) = req.params {
+                        if let Some(day_duration_val) = find_day_duration_recursively(params) {
+                            if let Some(mins) = parse_day_duration_setting(&day_duration_val) {
+                                log_msg(&format!("Setting DAY_DURATION_MINUTES (initialize) to {}", mins));
+                                DAY_DURATION_MINUTES.store(mins, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
                     let result = serde_json::json!({
                         "capabilities": {
                             "textDocumentSync": 1, // Full sync
@@ -654,6 +1207,9 @@ fn main() {
                                 "resolveProvider": false
                             },
                             "inlayHintProvider": true,
+                            "completionProvider": {
+                                "resolveProvider": false
+                            }
                         }
                     });
                     send_response(
@@ -850,6 +1406,21 @@ fn main() {
                         }
                     }
                 }
+                "textDocument/completion" => {
+                    log_msg("Handling textDocument/completion");
+                    
+                    let date_str = get_current_date().unwrap_or_else(|| "2026-05-21".to_string());
+                    let time_str = get_current_time().unwrap_or_else(|| "09:00".to_string());
+
+                    let completions = get_completions(&date_str, &time_str);
+
+                    send_response(
+                        &mut writer,
+                        req.id.clone(),
+                        Some(completions),
+                        None,
+                    );
+                }
                 _ => {
                     log_msg(&format!("Unhandled request method: {}", req.method));
                     send_response(
@@ -869,6 +1440,16 @@ fn main() {
                 "exit" => {
                     log_msg("Exit notification received. Exiting.");
                     break;
+                }
+                "workspace/didChangeConfiguration" => {
+                    if let Some(ref params) = notif.params {
+                        if let Some(day_duration_val) = find_day_duration_recursively(params) {
+                            if let Some(mins) = parse_day_duration_setting(&day_duration_val) {
+                                log_msg(&format!("Setting DAY_DURATION_MINUTES (didChange) to {}", mins));
+                                DAY_DURATION_MINUTES.store(mins, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
                 "textDocument/didOpen" => {
                     if let Some(params) = notif.params {
@@ -924,3 +1505,185 @@ fn main() {
     }
     log_msg("klog-lsp main loop ended.");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_days_in_month() {
+        assert_eq!(days_in_month(2026, 1), 31);
+        assert_eq!(days_in_month(2026, 2), 28);
+        assert_eq!(days_in_month(2024, 2), 29); // Leap year
+        assert_eq!(days_in_month(2000, 2), 29); // Leap year
+        assert_eq!(days_in_month(1900, 2), 28); // Not leap year
+        assert_eq!(days_in_month(2026, 4), 30);
+    }
+
+    #[test]
+    fn test_find_latest_date_in_content() {
+        let content = "2026-05-10\n  1h #project=Alpha\n\n2026-05-20\n  2h #project=Beta";
+        assert_eq!(find_latest_date_in_content(content), Some((2026, 5, 20)));
+
+        let content_slashes = "2026/04/15\n  1h\n2026/04/25\n  2h";
+        assert_eq!(find_latest_date_in_content(content_slashes), Some((2026, 4, 25)));
+
+        let content_empty = "no dates here";
+        assert_eq!(find_latest_date_in_content(content_empty), None);
+    }
+
+    #[test]
+    fn test_parse_duration_to_minutes() {
+        assert_eq!(parse_duration_to_minutes("1h30m"), Some(90));
+        assert_eq!(parse_duration_to_minutes("45m"), Some(45));
+        assert_eq!(parse_duration_to_minutes("2h"), Some(120));
+        assert_eq!(parse_duration_to_minutes("+1h15m"), Some(75));
+        assert_eq!(parse_duration_to_minutes("-30m"), Some(-30));
+        assert_eq!(parse_duration_to_minutes("8h!"), Some(480));
+    }
+
+    #[test]
+    fn test_format_minutes_to_duration() {
+        assert_eq!(format_minutes_to_duration(90), "1h30m");
+        assert_eq!(format_minutes_to_duration(45), "45m");
+        assert_eq!(format_minutes_to_duration(120), "2h");
+        assert_eq!(format_minutes_to_duration(-30), "-30m");
+        assert_eq!(format_minutes_to_duration(0), "0m");
+    }
+
+    #[test]
+    fn test_parse_duration_to_minutes_flexible() {
+        assert_eq!(parse_duration_to_minutes_flexible("7.7h"), Some(462));
+        assert_eq!(parse_duration_to_minutes_flexible("8h"), Some(480));
+        assert_eq!(parse_duration_to_minutes_flexible("7h30m"), Some(450));
+        assert_eq!(parse_duration_to_minutes_flexible("450m"), Some(450));
+        assert_eq!(parse_duration_to_minutes_flexible("7.5"), Some(450));
+        assert_eq!(parse_duration_to_minutes_flexible("8"), Some(480));
+        assert_eq!(parse_duration_to_minutes_flexible("450"), Some(450));
+        assert_eq!(parse_duration_to_minutes_flexible(""), None);
+    }
+
+    #[test]
+    fn test_parse_day_duration_setting() {
+        assert_eq!(parse_day_duration_setting(&serde_json::json!(7.7)), Some(462));
+        assert_eq!(parse_day_duration_setting(&serde_json::json!(8)), Some(480));
+        assert_eq!(parse_day_duration_setting(&serde_json::json!(450)), Some(450));
+        assert_eq!(parse_day_duration_setting(&serde_json::json!("7.7h")), Some(462));
+        assert_eq!(parse_day_duration_setting(&serde_json::json!("8h")), Some(480));
+        assert_eq!(parse_day_duration_setting(&serde_json::json!("7h30m")), Some(450));
+    }
+
+    #[test]
+    fn test_find_day_duration_recursively() {
+        let value = serde_json::json!({
+            "settings": {
+                "klog-lsp": {
+                    "day_duration": "7.7h"
+                }
+            }
+        });
+        assert_eq!(find_day_duration_recursively(&value), Some(serde_json::json!("7.7h")));
+
+        let val_direct = serde_json::json!({
+            "day_duration": 8
+        });
+        assert_eq!(find_day_duration_recursively(&val_direct), Some(serde_json::json!(8)));
+    }
+
+    #[test]
+    fn test_working_days_in_month() {
+        // May 2026 has 31 days, starts on Friday, ends on Sunday. 10 weekend days. 21 working days.
+        assert_eq!(working_days_in_month(2026, 5), 21);
+        // Feb 2026 has 28 days, starts on Sunday. 8 weekend days. 20 working days.
+        assert_eq!(working_days_in_month(2026, 2), 20);
+        // Jan 2026 has 31 days, starts on Thursday. 9 weekend days. 22 working days.
+        assert_eq!(working_days_in_month(2026, 1), 22);
+    }
+
+    #[test]
+    fn test_proportional_project_estimations() {
+        // May 2026 has 21 working days.
+        // If we set day_duration to 7h42m (462 minutes), the total end-of-month target is 21 * 462 = 9702 minutes (21d).
+        // If total tracked is 5h (300 mins), Project Alpha has 2h (120 mins) and Project Beta has 3h (180 mins).
+        // Ratio = 9702 / 300 = 32.34.
+        // Project Alpha est: 120 * 32.34 = 3880.8 => 3881 mins => 8.4d.
+        // Project Beta est: 180 * 32.34 = 5821.2 => 5821 mins => 12.6d.
+        // Total est: 21d.
+        let content = "2026-05-20 (8h!)\n  9:00 - 11:00 #project=Alpha\n  11:00 - 14:00 #project=Beta\n";
+        
+        // Reset/make sure day duration is at default (7h42m = 462 mins)
+        DAY_DURATION_MINUTES.store(462, std::sync::atomic::Ordering::Relaxed);
+
+        let breakdown = get_project_aligned_text(content).unwrap();
+        println!("Aligned project breakdown:\n{}", breakdown);
+        
+        // Verify output table rows are present and aligned properly
+        assert!(breakdown.contains("#project=Alpha"));
+        assert!(breakdown.contains("#project=Beta"));
+        assert!(breakdown.contains("8.4d"));
+        assert!(breakdown.contains("12.6d"));
+        assert!(breakdown.contains("21d"));
+
+        // Let's also verify the project hover report
+        let report = get_project_table_report(content).unwrap();
+        println!("Project table report:\n{}", report);
+        assert!(report.contains("`#project=Alpha`"));
+        assert!(report.contains("`#project=Beta`"));
+        assert!(report.contains("8.4d"));
+        assert!(report.contains("12.6d"));
+        assert!(report.contains("21d"));
+    }
+
+    #[test]
+    fn test_current_date_and_time_helpers() {
+        if let Some(date) = get_current_date() {
+            assert_eq!(date.len(), 10);
+            let parts: Vec<&str> = date.split('-').collect();
+            assert_eq!(parts.len(), 3);
+            assert_eq!(parts[0].len(), 4);
+            assert_eq!(parts[1].len(), 2);
+            assert_eq!(parts[2].len(), 2);
+        }
+        if let Some(time) = get_current_time() {
+            assert_eq!(time.len(), 5);
+            let parts: Vec<&str> = time.split(':').collect();
+            assert_eq!(parts.len(), 2);
+            assert_eq!(parts[0].len(), 2);
+            assert_eq!(parts[1].len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_get_completions() {
+        // Test with default day duration (7h42m = 462 mins)
+        DAY_DURATION_MINUTES.store(462, std::sync::atomic::Ordering::Relaxed);
+        let completions_default = get_completions("2026-05-21", "10:14");
+        let list_default = completions_default.as_array().expect("completions should be a list");
+        
+        let find_insert_text = |list: &[serde_json::Value], lbl: &str| -> String {
+            list.iter()
+                .find(|item| item["label"].as_str().unwrap() == lbl)
+                .and_then(|item| item["insertText"].as_str())
+                .unwrap()
+                .to_string()
+        };
+
+        assert_eq!(find_insert_text(list_default, "today"), "${1:2026-05-21} (${2:7h42m!})");
+        assert_eq!(find_insert_text(list_default, "date"), "${1:YYYY-MM-DD} (${2:7h42m!})");
+        assert_eq!(find_insert_text(list_default, "20"), "${1:2026-05-21} (${2:7h42m!})");
+        assert_eq!(find_insert_text(list_default, "2026-05-21"), "${1:2026-05-21} (${2:7h42m!})");
+        assert_eq!(find_insert_text(list_default, "record"), "${1:2026-05-21} (${2:7h42m!})\n${3:Summary}\n    $0");
+
+        // Test with custom day duration (8h = 480 mins)
+        DAY_DURATION_MINUTES.store(480, std::sync::atomic::Ordering::Relaxed);
+        let completions_8h = get_completions("2026-05-21", "10:14");
+        let list_8h = completions_8h.as_array().expect("completions should be a list");
+
+        assert_eq!(find_insert_text(list_8h, "today"), "${1:2026-05-21} (${2:8h!})");
+        assert_eq!(find_insert_text(list_8h, "date"), "${1:YYYY-MM-DD} (${2:8h!})");
+        assert_eq!(find_insert_text(list_8h, "20"), "${1:2026-05-21} (${2:8h!})");
+        assert_eq!(find_insert_text(list_8h, "2026-05-21"), "${1:2026-05-21} (${2:8h!})");
+        assert_eq!(find_insert_text(list_8h, "record"), "${1:2026-05-21} (${2:8h!})\n${3:Summary}\n    $0");
+    }
+}
+

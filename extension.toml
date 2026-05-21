@@ -5,6 +5,8 @@ schema_version = 1
 authors = ["Quentin Robcis"]
 description = "Support for the klog plain-text time-tracking format."
 repository = "https://github.com/quentinrobcis/klog-zed"
+snippets = "./snippets/klog.json"
+
 
 [grammars.klog]
 repository = "https://github.com/Ansimorph/tree-sitter-klog"
