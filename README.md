@@ -254,6 +254,32 @@ By default, any duration equal to or exceeding 7 hours and 42 minutes (`7h42m`) 
 }
 ```
 
+### Custom Klog Executable Path
+
+By default, the LSP will search for a `klog` executable in your `$PATH`. If your `klog` binary is installed in a custom location, you can configure the exact path in your `settings.json` under `initialization_options` for `klog-lsp`:
+
+```jsonc
+// settings.json
+{
+  "lsp": {
+    "klog-lsp": {
+      "initialization_options": {
+        "klog_path": "/path/to/custom/klog"
+      }
+    }
+  }
+}
+```
+
+### Document Formatting & Code Actions
+
+This extension supports built-in formatting, diagnostics, and quick-fix code actions:
+- **Format Document**: Runs `klog print` on your file to keep indentation and structures clean and aligned. You can trigger this manually (`⌘⇧I` or format document command) or enable format-on-save in Zed.
+- **Diagnostics**: Real-time syntax errors and logical warnings from `klog json` are displayed inline as editor diagnostics.
+- **Start/Stop Timer Code Actions**:
+  - **Start open-ended time entry at [current_time]**: Offered when your cursor is inside a record. It appends a new open-ended time entry `    HH:MM - ?` at the current time.
+  - **Stop active timer at [current_time] (line X)**: Offered when there are open-ended time entries (`?`) in your document. It replaces the selected `?` with the current time.
+
 ---
 
 ## Architecture

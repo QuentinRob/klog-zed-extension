@@ -5,6 +5,7 @@ use std::io::{self, BufRead, Write};
 use std::process::Command;
 
 static DAY_DURATION_MINUTES: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(462);
+static KLOG_PATH: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 fn get_day_duration_minutes() -> i32 {
     let val = DAY_DURATION_MINUTES.load(std::sync::atomic::Ordering::Relaxed);
@@ -14,6 +15,38 @@ fn get_day_duration_minutes() -> i32 {
         val
     }
 }
+
+fn get_klog_path() -> String {
+    if let Ok(guard) = KLOG_PATH.read() {
+        if let Some(ref path) = *guard {
+            return path.clone();
+        }
+    }
+    "klog".to_string()
+}
+
+fn find_klog_path_recursively(value: &serde_json::Value) -> Option<String> {
+    if let Some(obj) = value.as_object() {
+        if let Some(val) = obj.get("klog_path") {
+            if let Some(s) = val.as_str() {
+                return Some(s.to_string());
+            }
+        }
+        for (_, val) in obj {
+            if let Some(res) = find_klog_path_recursively(val) {
+                return Some(res);
+            }
+        }
+    } else if let Some(arr) = value.as_array() {
+        for val in arr {
+            if let Some(res) = find_klog_path_recursively(val) {
+                return Some(res);
+            }
+        }
+    }
+    None
+}
+
 
 /// Parses a duration string that can contain decimals (e.g. "7.7h", "8h", "7h30m", "450m") into total minutes.
 /// Note that floats are not supported by the klog format itself, but are parsed here for configuration convenience.
@@ -254,6 +287,45 @@ struct InlayHint {
     padding_right: Option<bool>,
 }
 
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct CodeActionParams {
+    #[serde(rename = "textDocument")]
+    text_document: TextDocumentIdentifier,
+    range: Range,
+    context: CodeActionContext,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct CodeActionContext {
+    diagnostics: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize, Debug)]
+struct CodeAction {
+    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edit: Option<WorkspaceEdit>,
+    #[serde(rename = "isPreferred", skip_serializing_if = "Option::is_none")]
+    is_preferred: Option<bool>,
+}
+
+#[derive(Serialize, Debug)]
+struct WorkspaceEdit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    changes: Option<HashMap<String, Vec<TextEdit>>>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct TextEdit {
+    range: Range,
+    #[serde(rename = "newText")]
+    new_text: String,
+}
+
 fn log_msg(msg: &str) {
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
@@ -312,6 +384,108 @@ fn send_response<W: Write>(
         log_msg(&format!("Sending response: {}", msg));
         let _ = write_message(writer, &msg);
     }
+}
+
+fn send_notification<W: Write>(
+    writer: &mut W,
+    method: &str,
+    params: Option<serde_json::Value>,
+) {
+    let notif = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params
+    });
+    if let Ok(msg) = serde_json::to_string(&notif) {
+        log_msg(&format!("Sending notification: {}", msg));
+        let _ = write_message(writer, &msg);
+    }
+}
+
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct KlogJsonOutput {
+    records: Option<serde_json::Value>,
+    warnings: Option<Vec<String>>,
+    errors: Option<Vec<KlogJsonError>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct KlogJsonError {
+    line: usize,
+    column: usize,
+    length: usize,
+    title: String,
+    details: String,
+}
+
+fn publish_diagnostics<W: Write>(uri: &str, content: &str, writer: &mut W) {
+    let mut diagnostics = Vec::new();
+
+    // Call klog json on content
+    if let Some(json_str) = run_klog_command_raw(&["json"], content) {
+        if let Ok(output) = serde_json::from_str::<KlogJsonOutput>(&json_str) {
+            // Process errors
+            if let Some(errors) = output.errors {
+                for err in errors {
+                    let line_0 = err.line.saturating_sub(1) as u32;
+                    let col_0 = err.column.saturating_sub(1) as u32;
+                    let length = err.length as u32;
+
+                    diagnostics.push(serde_json::json!({
+                        "range": {
+                            "start": { "line": line_0, "character": col_0 },
+                            "end": { "line": line_0, "character": col_0 + length }
+                        },
+                        "severity": 1, // Error
+                        "code": "klog-syntax",
+                        "source": "klog",
+                        "message": format!("{}: {}", err.title, err.details)
+                    }));
+                }
+            }
+
+            // Process warnings
+            if let Some(warnings) = output.warnings {
+                for warn in warnings {
+                    let parts: Vec<&str> = warn.splitn(2, ':').collect();
+                    let mut matched_line = None;
+                    if parts.len() == 2 {
+                        let prefix = parts[0].trim();
+                        if !prefix.is_empty() {
+                            for (idx, line) in content.lines().enumerate() {
+                                if line.contains(prefix) {
+                                    matched_line = Some(idx);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    let line_idx = matched_line.unwrap_or(0);
+                    let line_len = content.lines().nth(line_idx).map(|l| l.len()).unwrap_or(0);
+
+                    diagnostics.push(serde_json::json!({
+                        "range": {
+                            "start": { "line": line_idx as u32, "character": 0 },
+                            "end": { "line": line_idx as u32, "character": line_len as u32 }
+                        },
+                        "severity": 2, // Warning
+                        "code": "klog-warning",
+                        "source": "klog",
+                        "message": warn.clone()
+                    }));
+                }
+            }
+        }
+    }
+
+    let params = serde_json::json!({
+        "uri": uri,
+        "diagnostics": diagnostics
+    });
+    send_notification(writer, "textDocument/publishDiagnostics", Some(params));
 }
 
 fn is_date_line(line: &str) -> bool {
@@ -382,8 +556,9 @@ fn find_tag_under_cursor(line: &str, char_idx: usize) -> Option<String> {
 }
 
 fn run_klog_command(args: &[&str], input: &str) -> Option<String> {
-    log_msg(&format!("Running klog {:?}", args));
-    let mut child = Command::new("klog")
+    let klog_executable = get_klog_path();
+    log_msg(&format!("Running {} {:?}", klog_executable, args));
+    let mut child = Command::new(&klog_executable)
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -407,6 +582,33 @@ fn run_klog_command(args: &[&str], input: &str) -> Option<String> {
     }
     None
 }
+
+fn run_klog_command_raw(args: &[&str], input: &str) -> Option<String> {
+    let klog_executable = get_klog_path();
+    log_msg(&format!("Running raw {} {:?}", klog_executable, args));
+    let mut child = Command::new(&klog_executable)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input.as_bytes());
+    }
+
+    let output = child.wait_with_output().ok()?;
+    if output.status.success() {
+        let stdout_str = String::from_utf8_lossy(&output.stdout).to_string();
+        return Some(stdout_str);
+    } else {
+        let stderr_str = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        log_msg(&format!("klog command failed. stderr: {}", stderr_str));
+    }
+    None
+}
+
 
 fn format_days(days: f64) -> String {
     let s = format!("{:.2}", days);
@@ -518,7 +720,136 @@ fn get_current_time() -> Option<String> {
     }
 }
 
-fn get_completions(date_str: &str, time_str: &str) -> serde_json::Value {
+fn extract_tags(content: &str) -> Vec<String> {
+    let mut tags = std::collections::HashSet::new();
+    for line in content.lines() {
+        for word in line.split_whitespace() {
+            if word.starts_with('#') {
+                let tag = word.trim_end_matches(|c: char| c.is_ascii_punctuation() && c != '=' && c != '-' && c != '_');
+                if tag.len() > 1 {
+                    tags.insert(tag.to_string());
+                    if let Some(pos) = tag.find('=') {
+                        tags.insert(tag[..=pos].to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut tag_list: Vec<String> = tags.into_iter().collect();
+    tag_list.sort();
+    tag_list
+}
+
+fn find_open_range_question_mark(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let c = trimmed.chars().next()?;
+    if !c.is_ascii_digit() && c != '<' && c != '>' {
+        return None;
+    }
+    if let Some(hyphen_idx) = line.find('-') {
+        let after_hyphen = &line[hyphen_idx + 1..];
+        if let Some(q_offset) = after_hyphen.find('?') {
+            let between = &after_hyphen[..q_offset];
+            if between.chars().all(|c| c.is_whitespace()) {
+                return Some(hyphen_idx + 1 + q_offset);
+            }
+        }
+    }
+    None
+}
+
+fn get_code_actions(
+    uri: &str,
+    content: &str,
+    range: Range,
+) -> Vec<CodeAction> {
+    let mut actions = Vec::new();
+    let current_time = match get_current_time() {
+        Some(t) => t,
+        None => return actions,
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+
+    // 1. "Start open-ended time entry at [current_time]"
+    let cursor_line = range.start.line as usize;
+    if cursor_line < lines.len() {
+        if find_date_for_line(content, cursor_line).is_some() {
+            let line_content = lines[cursor_line];
+            let end_char = line_content.len() as u32;
+            
+            let mut changes = HashMap::new();
+            changes.insert(
+                uri.to_string(),
+                vec![TextEdit {
+                    range: Range {
+                        start: Position {
+                            line: cursor_line as u32,
+                            character: end_char,
+                        },
+                        end: Position {
+                            line: cursor_line as u32,
+                            character: end_char,
+                        },
+                    },
+                    new_text: format!("\n    {} - ?", current_time),
+                }],
+            );
+
+            actions.push(CodeAction {
+                title: format!("Start open-ended time entry at {}", current_time),
+                kind: Some("quickfix".to_string()),
+                edit: Some(WorkspaceEdit { changes: Some(changes) }),
+                is_preferred: Some(true),
+            });
+        }
+    }
+
+    // 2. "Stop active timer at [current_time]"
+    for (line_idx, line) in lines.iter().enumerate() {
+        if line.contains('?') {
+            if find_date_for_line(content, line_idx).is_some() {
+                if let Some(char_idx) = find_open_range_question_mark(line) {
+                    let mut changes = HashMap::new();
+                    changes.insert(
+                        uri.to_string(),
+                        vec![TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: line_idx as u32,
+                                    character: char_idx as u32,
+                                },
+                                end: Position {
+                                    line: line_idx as u32,
+                                    character: (char_idx + 1) as u32,
+                                },
+                            },
+                            new_text: current_time.clone(),
+                        }],
+                    );
+
+                    actions.push(CodeAction {
+                        title: format!(
+                            "Stop active timer at {} (line {})",
+                            current_time,
+                            line_idx + 1
+                        ),
+                        kind: Some("quickfix".to_string()),
+                        edit: Some(WorkspaceEdit { changes: Some(changes) }),
+                        is_preferred: Some(true),
+                    });
+                }
+            }
+        }
+    }
+
+    actions
+}
+
+fn get_completions(date_str: &str, time_str: &str, content: Option<&str>) -> serde_json::Value {
     let hour = if time_str.len() >= 2 { &time_str[..2] } else { "00" };
     let mins = get_day_duration_minutes();
     let duration_str = format_minutes_to_duration(mins);
@@ -527,7 +858,7 @@ fn get_completions(date_str: &str, time_str: &str) -> serde_json::Value {
     let date_snippet_prefilled = format!("${{1:{}}} (${{2:{}!}})", date_str, duration_str);
     let date_snippet_not_prefilled = format!("${{1:YYYY-MM-DD}} (${{2:{}!}})", duration_str);
 
-    serde_json::json!([
+    let mut items = serde_json::json!([
         {
             "label": "today",
             "insertText": date_snippet_prefilled,
@@ -597,7 +928,22 @@ fn get_completions(date_str: &str, time_str: &str) -> serde_json::Value {
             "kind": 15,
             "detail": "Inserts an open-ended timespan starting at the current time"
         }
-    ])
+    ]);
+
+    if let Some(text) = content {
+        if let Some(arr) = items.as_array_mut() {
+            for tag in extract_tags(text) {
+                arr.push(serde_json::json!({
+                    "label": tag,
+                    "insertText": tag,
+                    "kind": 12,
+                    "detail": "Tag from document"
+                }));
+            }
+        }
+    }
+
+    items
 }
 
 /// Sakamoto's algorithm: returns 0 for Sunday, 1 for Monday, ..., 6 for Saturday.
@@ -1198,6 +1544,12 @@ fn main() {
                                 DAY_DURATION_MINUTES.store(mins, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
+                        if let Some(path_val) = find_klog_path_recursively(params) {
+                            log_msg(&format!("Setting KLOG_PATH (initialize) to {}", path_val));
+                            if let Ok(mut guard) = KLOG_PATH.write() {
+                                *guard = Some(path_val);
+                            }
+                        }
                     }
                     let result = serde_json::json!({
                         "capabilities": {
@@ -1209,7 +1561,9 @@ fn main() {
                             "inlayHintProvider": true,
                             "completionProvider": {
                                 "resolveProvider": false
-                            }
+                            },
+                            "documentFormattingProvider": true,
+                            "codeActionProvider": true
                         }
                     });
                     send_response(
@@ -1409,15 +1763,91 @@ fn main() {
                 "textDocument/completion" => {
                     log_msg("Handling textDocument/completion");
                     
+                    let mut doc_content: Option<String> = None;
+                    if let Some(ref params) = req.params {
+                        if let Some(uri_val) = params.get("textDocument").and_then(|td| td.get("uri")) {
+                            if let Some(uri_str) = uri_val.as_str() {
+                                if let Some(content) = documents.get(uri_str) {
+                                    doc_content = Some(content.clone());
+                                }
+                            }
+                        }
+                    }
+
                     let date_str = get_current_date().unwrap_or_else(|| "2026-05-21".to_string());
                     let time_str = get_current_time().unwrap_or_else(|| "09:00".to_string());
 
-                    let completions = get_completions(&date_str, &time_str);
+                    let completions = get_completions(&date_str, &time_str, doc_content.as_deref());
 
                     send_response(
                         &mut writer,
                         req.id.clone(),
                         Some(completions),
+                        None,
+                    );
+                }
+                "textDocument/formatting" => {
+                    log_msg("Handling textDocument/formatting");
+                    let mut text_edits = serde_json::json!(null);
+
+                    if let Some(ref params) = req.params {
+                        if let Some(uri_val) = params.get("textDocument").and_then(|td| td.get("uri")) {
+                            if let Some(uri_str) = uri_val.as_str() {
+                                if let Some(content) = documents.get(uri_str) {
+                                    // Run klog print --no-style to format the document
+                                    if let Some(formatted) = run_klog_command_raw(&["print", "--no-style"], content) {
+                                        let lines: Vec<&str> = content.lines().collect();
+                                        let end_line = lines.len().saturating_sub(1);
+                                        let end_char = lines.last().map(|l| l.len()).unwrap_or(0);
+
+                                        text_edits = serde_json::json!([
+                                            {
+                                                "range": {
+                                                    "start": { "line": 0, "character": 0 },
+                                                    "end": { "line": end_line, "character": end_char }
+                                                },
+                                                "newText": formatted
+                                            }
+                                        ]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    send_response(
+                        &mut writer,
+                        req.id.clone(),
+                        Some(text_edits),
+                        None,
+                    );
+                }
+                "textDocument/codeAction" => {
+                    log_msg("Handling textDocument/codeAction");
+                    let mut actions = serde_json::json!([]);
+
+                    if let Some(ref params) = req.params {
+                        if let Ok(code_action_params) =
+                            serde_json::from_value::<CodeActionParams>(params.clone())
+                        {
+                            let uri_str = &code_action_params.text_document.uri;
+                            if let Some(content) = documents.get(uri_str) {
+                                let actions_list = get_code_actions(
+                                    uri_str,
+                                    content,
+                                    code_action_params.range,
+                                );
+                                actions = serde_json::to_value(actions_list).unwrap_or(serde_json::json!([]));
+                            }
+                        } else {
+                            log_msg("Failed to parse CodeActionParams");
+                        }
+                    }
+
+                    send_response(
+                        &mut writer,
+                        req.id.clone(),
+                        Some(actions),
                         None,
                     );
                 }
@@ -1449,6 +1879,16 @@ fn main() {
                                 DAY_DURATION_MINUTES.store(mins, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
+                        if let Some(path_val) = find_klog_path_recursively(params) {
+                            log_msg(&format!("Setting KLOG_PATH (didChange) to {}", path_val));
+                            if let Ok(mut guard) = KLOG_PATH.write() {
+                                *guard = Some(path_val);
+                            }
+                        }
+                        // Re-validate all documents
+                        for (uri, content) in &documents {
+                            publish_diagnostics(uri, content, &mut writer);
+                        }
                     }
                 }
                 "textDocument/didOpen" => {
@@ -1458,8 +1898,13 @@ fn main() {
                         {
                             log_msg(&format!("Opened document: {}", open_params.text_document.uri));
                             documents.insert(
-                                open_params.text_document.uri,
-                                open_params.text_document.text,
+                                open_params.text_document.uri.clone(),
+                                open_params.text_document.text.clone(),
+                            );
+                            publish_diagnostics(
+                                &open_params.text_document.uri,
+                                &open_params.text_document.text,
+                                &mut writer,
                             );
                         } else {
                             log_msg("Failed to parse DidOpenTextDocumentParams");
@@ -1474,8 +1919,13 @@ fn main() {
                             log_msg(&format!("Changed document: {}", change_params.text_document.uri));
                             if let Some(change) = change_params.content_changes.first() {
                                 documents.insert(
-                                    change_params.text_document.uri,
+                                    change_params.text_document.uri.clone(),
                                     change.text.clone(),
+                                );
+                                publish_diagnostics(
+                                    &change_params.text_document.uri,
+                                    &change.text,
+                                    &mut writer,
                                 );
                             }
                         } else {
@@ -1490,6 +1940,11 @@ fn main() {
                         {
                             log_msg(&format!("Closed document: {}", close_params.text_document.uri));
                             documents.remove(&close_params.text_document.uri);
+                            let clear_params = serde_json::json!({
+                                "uri": close_params.text_document.uri,
+                                "diagnostics": []
+                            });
+                            send_notification(&mut writer, "textDocument/publishDiagnostics", Some(clear_params));
                         } else {
                             log_msg("Failed to parse DidCloseTextDocumentParams");
                         }
@@ -1657,7 +2112,7 @@ mod tests {
     fn test_get_completions() {
         // Test with default day duration (7h42m = 462 mins)
         DAY_DURATION_MINUTES.store(462, std::sync::atomic::Ordering::Relaxed);
-        let completions_default = get_completions("2026-05-21", "10:14");
+        let completions_default = get_completions("2026-05-21", "10:14", None);
         let list_default = completions_default.as_array().expect("completions should be a list");
         
         let find_insert_text = |list: &[serde_json::Value], lbl: &str| -> String {
@@ -1676,7 +2131,7 @@ mod tests {
 
         // Test with custom day duration (8h = 480 mins)
         DAY_DURATION_MINUTES.store(480, std::sync::atomic::Ordering::Relaxed);
-        let completions_8h = get_completions("2026-05-21", "10:14");
+        let completions_8h = get_completions("2026-05-21", "10:14", None);
         let list_8h = completions_8h.as_array().expect("completions should be a list");
 
         assert_eq!(find_insert_text(list_8h, "today"), "${1:2026-05-21} (${2:8h!})");
@@ -1684,6 +2139,75 @@ mod tests {
         assert_eq!(find_insert_text(list_8h, "20"), "${1:2026-05-21} (${2:8h!})");
         assert_eq!(find_insert_text(list_8h, "2026-05-21"), "${1:2026-05-21} (${2:8h!})");
         assert_eq!(find_insert_text(list_8h, "record"), "${1:2026-05-21} (${2:8h!})\n${3:Summary}\n    $0");
+    }
+
+    #[test]
+    fn test_find_open_range_question_mark() {
+        assert_eq!(find_open_range_question_mark("    10:00 - ?"), Some(12));
+        assert_eq!(find_open_range_question_mark("    10:00-?"), Some(10));
+        assert_eq!(find_open_range_question_mark("    <10:00 - ?"), Some(13));
+        assert_eq!(find_open_range_question_mark("    10:00 - 11:00 Did something?"), None);
+        assert_eq!(find_open_range_question_mark("    not a time entry - ?"), None);
+    }
+
+    #[test]
+    fn test_get_code_actions() {
+        let content = "2026-05-21 (8h!)\n  9:00 - 10:00\n  10:00 - ?\n";
+        let uri = "file:///test.klg";
+        
+        let actions = get_code_actions(
+            uri,
+            content,
+            Range {
+                start: Position { line: 1, character: 5 },
+                end: Position { line: 1, character: 5 },
+            },
+        );
+        
+        assert_eq!(actions.len(), 2);
+        
+        let start_action = actions.iter().find(|a| a.title.starts_with("Start open-ended time entry")).unwrap();
+        let stop_action = actions.iter().find(|a| a.title.starts_with("Stop active timer")).unwrap();
+        
+        let start_edit = start_action.edit.as_ref().unwrap().changes.as_ref().unwrap().get(uri).unwrap();
+        assert_eq!(start_edit.len(), 1);
+        assert_eq!(start_edit[0].range.start.line, 1);
+        assert_eq!(start_edit[0].range.start.character, 14);
+        
+        let stop_edit = stop_action.edit.as_ref().unwrap().changes.as_ref().unwrap().get(uri).unwrap();
+        assert_eq!(stop_edit.len(), 1);
+        assert_eq!(stop_edit[0].range.start.line, 2);
+        assert_eq!(stop_edit[0].range.start.character, 10);
+    }
+
+    #[test]
+    fn test_extract_tags() {
+        let content = "2026-05-21\n  10:00 - 11:00 #work #project=Alpha\n  11:00 - 12:00 #meeting #project=Beta";
+        let tags = extract_tags(content);
+        assert_eq!(tags, vec![
+            "#meeting".to_string(),
+            "#project=".to_string(),
+            "#project=Alpha".to_string(),
+            "#project=Beta".to_string(),
+            "#work".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn test_find_klog_path_recursively() {
+        let value = serde_json::json!({
+            "settings": {
+                "klog-lsp": {
+                    "klog_path": "/usr/local/bin/klog"
+                }
+            }
+        });
+        assert_eq!(find_klog_path_recursively(&value), Some("/usr/local/bin/klog".to_string()));
+
+        let val_direct = serde_json::json!({
+            "klog_path": "klog-custom"
+        });
+        assert_eq!(find_klog_path_recursively(&val_direct), Some("klog-custom".to_string()));
     }
 }
 
