@@ -302,6 +302,22 @@ struct CodeActionContext {
     diagnostics: Vec<serde_json::Value>,
 }
 
+#[derive(Deserialize, Debug)]
+struct FoldingRangeParams {
+    #[serde(rename = "textDocument")]
+    text_document: TextDocumentIdentifier,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq, Clone)]
+struct FoldingRange {
+    #[serde(rename = "startLine")]
+    start_line: u32,
+    #[serde(rename = "endLine")]
+    end_line: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+}
+
 #[derive(Serialize, Debug)]
 struct CodeAction {
     title: String,
@@ -697,27 +713,11 @@ fn convert_duration_string(s: &str) -> String {
 }
 
 fn get_current_date() -> Option<String> {
-    let output = Command::new("date")
-        .arg("+%Y-%m-%d")
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
+    Some(chrono::Local::now().format("%Y-%m-%d").to_string())
 }
 
 fn get_current_time() -> Option<String> {
-    let output = Command::new("date")
-        .arg("+%H:%M")
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
+    Some(chrono::Local::now().format("%H:%M").to_string())
 }
 
 fn extract_tags(content: &str) -> Vec<String> {
@@ -1269,6 +1269,11 @@ fn get_project_breakdown(content: &str) -> Option<String> {
     get_project_aligned_text(content)
 }
 
+fn should_estimate_project(name: &str) -> bool {
+    let clean_name = name.strip_prefix("#project=").unwrap_or(name);
+    !matches!(clean_name, "ABSCP" | "RTTE" | "RTTS" | "ABSConv" | "ABSMal")
+}
+
 fn get_project_aligned_text(content: &str) -> Option<String> {
     let latest_date = find_latest_date_in_content(content);
     #[allow(unused_assignments)]
@@ -1342,19 +1347,75 @@ fn get_project_aligned_text(content: &str) -> Option<String> {
     let mut max_total_width = header_total.len();
     let mut max_est_width = header_est.len();
 
-    let mut rows = Vec::new();
+    let total_mins = total_time.as_ref().and_then(|t| parse_duration_to_minutes(t));
+
+    let mut raw_rows = Vec::new();
+    let mut max_raw_total_width = 0;
+    let mut max_raw_est_width = 0;
+
     for (name, raw_time) in &project_values {
-        let time_formatted = convert_duration_string(raw_time);
-        let est_formatted = if let Some(r) = ratio {
-            if let Some(mins) = parse_duration_to_minutes(raw_time) {
-                let est_mins = ((mins as f64) * r).round() as i32;
-                convert_duration_string(&format_minutes_to_duration(est_mins))
+        let time_raw = convert_duration_string(raw_time);
+        let est_raw = if let Some(r) = ratio {
+            if should_estimate_project(name) {
+                if let Some(mins) = parse_duration_to_minutes(raw_time) {
+                    let est_mins = ((mins as f64) * r).round() as i32;
+                    convert_duration_string(&format_minutes_to_duration(est_mins))
+                } else {
+                    "-".to_string()
+                }
             } else {
-                "-".to_string()
+                time_raw.clone()
             }
         } else {
             "-".to_string()
         };
+
+        max_raw_total_width = max_raw_total_width.max(time_raw.len());
+        if est_raw != "-" {
+            max_raw_est_width = max_raw_est_width.max(est_raw.len());
+        }
+
+        raw_rows.push((name.clone(), time_raw, est_raw));
+    }
+
+    let total_time_raw = if let Some(ref t) = total_time {
+        convert_duration_string(t)
+    } else {
+        "-".to_string()
+    };
+
+    let total_est_raw = if let Some((year, month, _)) = latest_date {
+        let working_days = working_days_in_month(year, month);
+        let day_duration = get_day_duration_minutes();
+        let est_mins = working_days * day_duration;
+        convert_duration_string(&format_minutes_to_duration(est_mins))
+    } else {
+        "-".to_string()
+    };
+
+    max_raw_total_width = max_raw_total_width.max(total_time_raw.len());
+    if total_est_raw != "-" {
+        max_raw_est_width = max_raw_est_width.max(total_est_raw.len());
+    }
+
+    let mut rows = Vec::new();
+    for (name, time_raw, est_raw) in raw_rows {
+        let mut time_formatted = time_raw.clone();
+        let mut est_formatted = est_raw.clone();
+
+        if let Some(tot_m) = total_mins {
+            if tot_m > 0 {
+                if let Some((_, original_raw_time)) = project_values.iter().find(|(n, _)| format!("#project={}", n) == name || n == &name) {
+                    if let Some(mins) = parse_duration_to_minutes(original_raw_time) {
+                        let pct = (mins as f64 / tot_m as f64) * 100.0;
+                        time_formatted = format!("{:<width$} ({:.1}%)", time_raw, pct, width = max_raw_total_width);
+                        if est_raw != "-" {
+                            est_formatted = format!("{:<width$} ({:.1}%)", est_raw, pct, width = max_raw_est_width);
+                        }
+                    }
+                }
+            }
+        }
 
         max_project_width = max_project_width.max(name.len());
         max_total_width = max_total_width.max(time_formatted.len());
@@ -1364,19 +1425,16 @@ fn get_project_aligned_text(content: &str) -> Option<String> {
     }
 
     let total_label = "Total";
-    let total_time_formatted = if let Some(ref t) = total_time {
-        convert_duration_string(t)
+    let total_time_formatted = if total_time.is_some() && total_mins.is_some() {
+        format!("{:<width$} (100.0%)", total_time_raw, width = max_raw_total_width)
     } else {
-        "-".to_string()
+        total_time_raw
     };
 
-    let total_est_formatted = if let Some((year, month, _)) = latest_date {
-        let working_days = working_days_in_month(year, month);
-        let day_duration = get_day_duration_minutes();
-        let est_mins = working_days * day_duration;
-        convert_duration_string(&format_minutes_to_duration(est_mins))
+    let total_est_formatted = if latest_date.is_some() && total_mins.is_some() && total_est_raw != "-" {
+        format!("{:<width$} (100.0%)", total_est_raw, width = max_raw_est_width)
     } else {
-        "-".to_string()
+        total_est_raw
     };
 
     max_project_width = max_project_width.max(total_label.len());
@@ -1485,36 +1543,96 @@ fn get_project_table_report(content: &str) -> Option<String> {
         None
     };
 
+    let total_mins = total_time.as_ref().and_then(|t| parse_duration_to_minutes(t));
+
+    let mut raw_rows = Vec::new();
+    let mut max_raw_total_width = 0;
+    let mut max_raw_est_width = 0;
+
+    for (name, raw_time) in &project_values {
+        let time_raw = convert_duration_string(raw_time);
+        let est_raw = if let Some(r) = ratio {
+            if should_estimate_project(name) {
+                if let Some(mins) = parse_duration_to_minutes(raw_time) {
+                    let est_mins = ((mins as f64) * r).round() as i32;
+                    convert_duration_string(&format_minutes_to_duration(est_mins))
+                } else {
+                    "-".to_string()
+                }
+            } else {
+                time_raw.clone()
+            }
+        } else {
+            "-".to_string()
+        };
+
+        max_raw_total_width = max_raw_total_width.max(time_raw.len());
+        if est_raw != "-" {
+            max_raw_est_width = max_raw_est_width.max(est_raw.len());
+        }
+
+        raw_rows.push((name.clone(), time_raw, est_raw));
+    }
+
+    let total_time_raw = if let Some(ref t) = total_time {
+        convert_duration_string(t)
+    } else {
+        "-".to_string()
+    };
+
+    let total_est_raw = if let Some((year, month, _)) = latest_date {
+        let working_days = working_days_in_month(year, month);
+        let day_duration = get_day_duration_minutes();
+        let est_mins = working_days * day_duration;
+        convert_duration_string(&format_minutes_to_duration(est_mins))
+    } else {
+        "-".to_string()
+    };
+
+    max_raw_total_width = max_raw_total_width.max(total_time_raw.len());
+    if total_est_raw != "-" {
+        max_raw_est_width = max_raw_est_width.max(total_est_raw.len());
+    }
+
     let mut table = String::new();
     table.push_str("### Project Report\n\n");
     table.push_str("| Project | Total Time | Est. End |\n");
     table.push_str("| :--- | :--- | :--- |\n");
 
-    for (name, raw_time) in project_values {
-        let time_formatted = convert_duration_string(&raw_time);
-        let est_formatted = if let Some(r) = ratio {
-            if let Some(mins) = parse_duration_to_minutes(&raw_time) {
-                let est_mins = ((mins as f64) * r).round() as i32;
-                convert_duration_string(&format_minutes_to_duration(est_mins))
-            } else {
-                "-".to_string()
+    for (name, time_raw, est_raw) in raw_rows {
+        let mut time_formatted = time_raw.clone();
+        let mut est_formatted = est_raw.clone();
+
+        if let Some(tot_m) = total_mins {
+            if tot_m > 0 {
+                if let Some((_, original_raw_time)) = project_values.iter().find(|(n, _)| format!("#project={}", n) == name || n == &name) {
+                    if let Some(mins) = parse_duration_to_minutes(original_raw_time) {
+                        let pct = (mins as f64 / tot_m as f64) * 100.0;
+                        time_formatted = format!("{:<width$} ({:.1}%)", time_raw, pct, width = max_raw_total_width);
+                        if est_raw != "-" {
+                            est_formatted = format!("{:<width$} ({:.1}%)", est_raw, pct, width = max_raw_est_width);
+                        }
+                    }
+                }
             }
-        } else {
-            "-".to_string()
-        };
+        }
+
         table.push_str(&format!("| `#project={}` | {} | {} |\n", name, time_formatted, est_formatted));
     }
 
-    if let Some(total) = total_time {
-        let total_formatted = convert_duration_string(&total);
-        let total_est_formatted = if let Some((year, month, _)) = latest_date {
-            let working_days = working_days_in_month(year, month);
-            let day_duration = get_day_duration_minutes();
-            let est_mins = working_days * day_duration;
-            convert_duration_string(&format_minutes_to_duration(est_mins))
+    if total_time.is_some() {
+        let total_formatted = if total_mins.is_some() {
+            format!("{:<width$} (100.0%)", total_time_raw, width = max_raw_total_width)
         } else {
-            "-".to_string()
+            total_time_raw
         };
+
+        let total_est_formatted = if latest_date.is_some() && total_mins.is_some() && total_est_raw != "-" {
+            format!("{:<width$} (100.0%)", total_est_raw, width = max_raw_est_width)
+        } else {
+            total_est_raw
+        };
+
         table.push_str(&format!("| **Total** | **{}** | **{}** |\n", total_formatted, total_est_formatted));
     }
 
@@ -1563,7 +1681,8 @@ fn main() {
                                 "resolveProvider": false
                             },
                             "documentFormattingProvider": true,
-                            "codeActionProvider": true
+                            "codeActionProvider": true,
+                            "foldingRangeProvider": true
                         }
                     });
                     send_response(
@@ -1794,11 +1913,15 @@ fn main() {
                         if let Some(uri_val) = params.get("textDocument").and_then(|td| td.get("uri")) {
                             if let Some(uri_str) = uri_val.as_str() {
                                 if let Some(content) = documents.get(uri_str) {
-                                    // Run klog print --no-style to format the document
-                                    if let Some(formatted) = run_klog_command_raw(&["print", "--no-style"], content) {
-                                        let lines: Vec<&str> = content.lines().collect();
-                                        let end_line = lines.len().saturating_sub(1);
-                                        let end_char = lines.last().map(|l| l.len()).unwrap_or(0);
+                                    // Run klog print --no-style --no-warn to format the document
+                                    if let Some(formatted) = run_klog_command_raw(&["print", "--no-style", "--no-warn"], content) {
+                                        let aligned = align_klog_content(&formatted);
+                                        let mut final_text = aligned.trim_end().to_string();
+                                        final_text.push('\n');
+
+                                        let split_lines: Vec<&str> = content.split('\n').collect();
+                                        let end_line = split_lines.len().saturating_sub(1);
+                                        let end_char = split_lines.last().map(|l| l.len()).unwrap_or(0);
 
                                         text_edits = serde_json::json!([
                                             {
@@ -1806,7 +1929,7 @@ fn main() {
                                                     "start": { "line": 0, "character": 0 },
                                                     "end": { "line": end_line, "character": end_char }
                                                 },
-                                                "newText": formatted
+                                                "newText": final_text
                                             }
                                         ]);
                                     }
@@ -1819,6 +1942,31 @@ fn main() {
                         &mut writer,
                         req.id.clone(),
                         Some(text_edits),
+                        None,
+                    );
+                }
+                "textDocument/foldingRange" => {
+                    log_msg("Handling textDocument/foldingRange");
+                    let mut folding_ranges = serde_json::json!([]);
+
+                    if let Some(ref params) = req.params {
+                        if let Ok(folding_params) =
+                            serde_json::from_value::<FoldingRangeParams>(params.clone())
+                        {
+                            let uri_str = &folding_params.text_document.uri;
+                            if let Some(content) = documents.get(uri_str) {
+                                let ranges = get_folding_ranges(content);
+                                folding_ranges = serde_json::to_value(ranges).unwrap_or(serde_json::json!([]));
+                            }
+                        } else {
+                            log_msg("Failed to parse FoldingRangeParams");
+                        }
+                    }
+
+                    send_response(
+                        &mut writer,
+                        req.id.clone(),
+                        Some(folding_ranges),
                         None,
                     );
                 }
@@ -1961,6 +2109,382 @@ fn main() {
     log_msg("klog-lsp main loop ended.");
 }
 
+struct TimeEntryParts<'a> {
+    is_range: bool,
+    has_leading_bracket: bool,
+    start_time: &'a str,
+    end_time: Option<&'a str>,
+    has_trailing_bracket: bool,
+    duration: Option<&'a str>,
+    rest: &'a str,
+}
+
+fn parse_time_entry_line(line: &str) -> Option<TimeEntryParts<'_>> {
+    if !line.starts_with("    ") || line.starts_with("     ") {
+        return None;
+    }
+    let content = &line[4..];
+    if content.is_empty() {
+        return None;
+    }
+
+    // Check if it starts with '<'
+    let has_leading_bracket = content.starts_with('<');
+    let s = if has_leading_bracket {
+        &content[1..]
+    } else {
+        content
+    };
+
+    // Find the first token (start_time or duration)
+    let mut chars = s.char_indices().peekable();
+    let mut end_token1 = 0;
+    while let Some(&(idx, c)) = chars.peek() {
+        if c.is_whitespace() || (c == '-' && idx > 0) {
+            break;
+        }
+        end_token1 = idx + c.len_utf8();
+        chars.next();
+    }
+
+    if end_token1 == 0 {
+        return None;
+    }
+
+    let token1 = &s[..end_token1];
+    let rest = &s[end_token1..];
+
+    if token1.contains(':') {
+        // It's a time range start. Let's find the '-'
+        let mut rest_chars = rest.char_indices().peekable();
+        let mut hyphen_idx = None;
+        while let Some(&(idx, c)) = rest_chars.peek() {
+            if c == '-' {
+                hyphen_idx = Some(idx);
+                break;
+            } else if !c.is_whitespace() {
+                // If we encounter a non-whitespace character before a hyphen, it's not a valid time range
+                return None;
+            }
+            rest_chars.next();
+        }
+
+        if let Some(h_idx) = hyphen_idx {
+            let after_hyphen = &rest[h_idx + 1..];
+            let end_time_start = after_hyphen.trim_start();
+            let mut end_time_chars = end_time_start.char_indices().peekable();
+            let mut end_token_len = 0;
+            while let Some(&(idx, c)) = end_time_chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                end_token_len = idx + c.len_utf8();
+                end_time_chars.next();
+            }
+
+            if end_token_len == 0 {
+                return None;
+            }
+
+            let mut end_token = &end_time_start[..end_token_len];
+            let has_trailing_bracket = end_token.ends_with('>');
+            if has_trailing_bracket {
+                end_token = &end_token[..end_token.len() - 1];
+            }
+
+            if end_token == "?" || end_token.contains(':') {
+                let rest_after_range = &end_time_start[end_token_len..];
+                return Some(TimeEntryParts {
+                    is_range: true,
+                    has_leading_bracket,
+                    start_time: token1,
+                    end_time: Some(end_token),
+                    has_trailing_bracket,
+                    duration: None,
+                    rest: rest_after_range.trim_start(),
+                });
+            }
+        }
+    } else {
+        // Check if it's a duration
+        if parse_duration_to_minutes(token1).is_some() {
+            return Some(TimeEntryParts {
+                is_range: false,
+                has_leading_bracket: false,
+                start_time: "",
+                end_time: None,
+                has_trailing_bracket: false,
+                duration: Some(token1),
+                rest: rest.trim_start(),
+            });
+        }
+    }
+
+    None
+}
+
+fn split_tags_and_description(rest: &str) -> (String, String) {
+    let mut tags = Vec::new();
+    let mut description_start_idx = rest.len();
+    let mut temp_s = rest;
+
+    while !temp_s.is_empty() {
+        let trimmed = temp_s.trim_start();
+        if trimmed.starts_with('#') {
+            let word_len = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+            let tag = &trimmed[..word_len];
+            tags.push(tag);
+            temp_s = &trimmed[word_len..];
+        } else {
+            description_start_idx = rest.len() - temp_s.len();
+            break;
+        }
+    }
+
+    let tags_str = tags.join(" ");
+    let desc_str = rest[description_start_idx..].trim().to_string();
+    (tags_str, desc_str)
+}
+
+fn align_klog_content(content: &str) -> String {
+    let mut blocks = Vec::new();
+    let mut current_block = Vec::new();
+
+    for line in content.lines() {
+        if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+            if !current_block.is_empty() {
+                blocks.push(current_block);
+                current_block = Vec::new();
+            }
+        }
+        current_block.push(line);
+    }
+    if !current_block.is_empty() {
+        blocks.push(current_block);
+    }
+
+    let mut aligned_content = String::new();
+
+    for block in blocks {
+        enum BlockLine<'a> {
+            TimeEntry(ParsedTimeEntry<'a>),
+            Raw(&'a str),
+        }
+
+        struct ParsedTimeEntry<'a> {
+            is_range: bool,
+            has_leading_bracket: bool,
+            start_time: &'a str,
+            end_time: Option<&'a str>,
+            has_trailing_bracket: bool,
+            duration: Option<&'a str>,
+            tags_str: String,
+            desc_str: String,
+        }
+
+        let mut parsed_lines = Vec::new();
+        let mut max_time_str_len = 0;
+        let mut max_tags_len = 0;
+
+        for &line in &block {
+            if let Some(parts) = parse_time_entry_line(line) {
+                let (tags_str, desc_str) = split_tags_and_description(parts.rest);
+                max_tags_len = std::cmp::max(max_tags_len, tags_str.len());
+
+                parsed_lines.push(BlockLine::TimeEntry(ParsedTimeEntry {
+                    is_range: parts.is_range,
+                    has_leading_bracket: parts.has_leading_bracket,
+                    start_time: parts.start_time,
+                    end_time: parts.end_time,
+                    has_trailing_bracket: parts.has_trailing_bracket,
+                    duration: parts.duration,
+                    tags_str,
+                    desc_str,
+                }));
+            } else {
+                parsed_lines.push(BlockLine::Raw(line));
+            }
+        }
+
+        for pline in &parsed_lines {
+            if let BlockLine::TimeEntry(ref entry) = pline {
+                let start_part = if entry.has_leading_bracket {
+                    format!("<{}", entry.start_time)
+                } else {
+                    entry.start_time.to_string()
+                };
+
+                let end_part = if let Some(ref et) = entry.end_time {
+                    if entry.has_trailing_bracket {
+                        format!("{}>", et)
+                    } else {
+                        et.to_string()
+                    }
+                } else {
+                    "".to_string()
+                };
+
+                let time_str = if entry.is_range {
+                    format!("{} - {}", start_part, end_part)
+                } else {
+                    entry.duration.as_ref().unwrap().to_string()
+                };
+
+                max_time_str_len = std::cmp::max(max_time_str_len, time_str.len());
+            }
+        }
+
+        let tags_start_col = max_time_str_len + 3;
+        let desc_start_col = max_tags_len + 2;
+
+        for pline in parsed_lines {
+            match pline {
+                BlockLine::Raw(line) => {
+                    aligned_content.push_str(line);
+                    aligned_content.push('\n');
+                }
+                BlockLine::TimeEntry(entry) => {
+                    let start_part = if entry.has_leading_bracket {
+                        format!("<{}", entry.start_time)
+                    } else {
+                        entry.start_time.to_string()
+                    };
+
+                    let end_part = if let Some(et) = entry.end_time {
+                        if entry.has_trailing_bracket {
+                            format!("{}>", et)
+                        } else {
+                            et.to_string()
+                        }
+                    } else {
+                        "".to_string()
+                    };
+
+                    let time_str = if entry.is_range {
+                        format!("{} - {}", start_part, end_part)
+                    } else {
+                        entry.duration.as_ref().unwrap().to_string()
+                    };
+
+                    let time_padded = format!("{:width$}", time_str, width = tags_start_col);
+                    let mut formatted_line = format!("    {}", time_padded);
+
+                    if max_tags_len > 0 {
+                        let tags_padded = format!("{:width$}", entry.tags_str, width = desc_start_col);
+                        if !entry.desc_str.is_empty() {
+                            formatted_line.push_str(&format!("{}{}", tags_padded, entry.desc_str));
+                        } else if !entry.tags_str.is_empty() {
+                            formatted_line.push_str(&entry.tags_str);
+                        }
+                    } else {
+                        if !entry.desc_str.is_empty() {
+                            formatted_line.push_str(&entry.desc_str);
+                        }
+                    }
+                    let clean_line = formatted_line.trim_end();
+                    aligned_content.push_str(clean_line);
+                    aligned_content.push('\n');
+                }
+            }
+        }
+    }
+    aligned_content
+}
+
+fn get_folding_ranges(content: &str) -> Vec<FoldingRange> {
+    let mut folding_ranges = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    // 1. Day records folding ranges
+    let mut record_start_line: Option<usize> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+            if let Some(start) = record_start_line {
+                let mut end = idx - 1;
+                while end > start && lines[end].trim().is_empty() {
+                    end -= 1;
+                }
+                if end > start {
+                    folding_ranges.push(FoldingRange {
+                        start_line: start as u32,
+                        end_line: end as u32,
+                        kind: Some("region".to_string()),
+                    });
+                }
+            }
+            record_start_line = Some(idx);
+        }
+    }
+    if let Some(start) = record_start_line {
+        let mut end = lines.len().saturating_sub(1);
+        while end > start && lines[end].trim().is_empty() {
+            end -= 1;
+        }
+        if end > start {
+            folding_ranges.push(FoldingRange {
+                start_line: start as u32,
+                end_line: end as u32,
+                kind: Some("region".to_string()),
+            });
+        }
+    }
+
+    // 2. Time entries folding ranges
+    let mut entry_start_line: Option<usize> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        if parse_time_entry_line(line).is_some() {
+            if let Some(start) = entry_start_line {
+                let mut end = idx - 1;
+                while end > start && lines[end].trim().is_empty() {
+                    end -= 1;
+                }
+                if end > start {
+                    folding_ranges.push(FoldingRange {
+                        start_line: start as u32,
+                        end_line: end as u32,
+                        kind: Some("region".to_string()),
+                    });
+                }
+            }
+            entry_start_line = Some(idx);
+        } else if !line.trim().is_empty() {
+            if line.starts_with("     ") || line.starts_with("    \t") || line.starts_with("\t") {
+                // Continuation line, keep tracking
+            } else {
+                if let Some(start) = entry_start_line {
+                    let mut end = idx - 1;
+                    while end > start && lines[end].trim().is_empty() {
+                        end -= 1;
+                    }
+                    if end > start {
+                        folding_ranges.push(FoldingRange {
+                            start_line: start as u32,
+                            end_line: end as u32,
+                            kind: Some("region".to_string()),
+                        });
+                    }
+                    entry_start_line = None;
+                }
+            }
+        }
+    }
+    if let Some(start) = entry_start_line {
+        let mut end = lines.len().saturating_sub(1);
+        while end > start && lines[end].trim().is_empty() {
+            end -= 1;
+        }
+        if end > start {
+            folding_ranges.push(FoldingRange {
+                start_line: start as u32,
+                end_line: end as u32,
+                kind: Some("region".to_string()),
+            });
+        }
+    }
+
+    folding_ranges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2075,18 +2599,53 @@ mod tests {
         // Verify output table rows are present and aligned properly
         assert!(breakdown.contains("#project=Alpha"));
         assert!(breakdown.contains("#project=Beta"));
-        assert!(breakdown.contains("8.4d"));
-        assert!(breakdown.contains("12.6d"));
-        assert!(breakdown.contains("21d"));
+        assert!(breakdown.contains("2h (40.0%)"));
+        assert!(breakdown.contains("3h (60.0%)"));
+        assert!(breakdown.contains("8.4d  (40.0%)"));
+        assert!(breakdown.contains("12.6d (60.0%)"));
+        assert!(breakdown.contains("21d   (100.0%)"));
+        assert!(breakdown.contains("5h (100.0%)"));
 
         // Let's also verify the project hover report
         let report = get_project_table_report(content).unwrap();
         println!("Project table report:\n{}", report);
         assert!(report.contains("`#project=Alpha`"));
         assert!(report.contains("`#project=Beta`"));
-        assert!(report.contains("8.4d"));
-        assert!(report.contains("12.6d"));
-        assert!(report.contains("21d"));
+        assert!(report.contains("2h (40.0%)"));
+        assert!(report.contains("3h (60.0%)"));
+        assert!(report.contains("8.4d  (40.0%)"));
+        assert!(report.contains("12.6d (60.0%)"));
+        assert!(report.contains("21d   (100.0%)"));
+        assert!(report.contains("5h (100.0%)"));
+    }
+
+    #[test]
+    fn test_non_estimated_projects() {
+        // May 2026 has 21 working days. Total target capacity = 21 * 7h42m = 21d.
+        // Total tracked = 5h.
+        // Projects: ABSCP (2h), Alpha (3h).
+        // Ratio = 21d / 5h = 9702 mins / 300 mins = 32.34.
+        // Alpha (ratio-estimated): 3h * 32.34 = 97.02h = 5821.2 mins => 12.6d.
+        // ABSCP (no ratio estimation, stays same value): 2h.
+        let content = "2026-05-20 (8h!)\n  9:00 - 11:00 #project=ABSCP\n  11:00 - 14:00 #project=Alpha\n";
+        
+        DAY_DURATION_MINUTES.store(462, std::sync::atomic::Ordering::Relaxed);
+
+        let breakdown = get_project_aligned_text(content).unwrap();
+        println!("Aligned project breakdown with non-estimated:\n{}", breakdown);
+        
+        assert!(breakdown.contains("#project=ABSCP"));
+        assert!(breakdown.contains("#project=Alpha"));
+        assert!(breakdown.contains("2h (40.0%)")); // Both columns should have 2h for ABSCP
+        assert!(breakdown.contains("12.6d (60.0%)")); // Alpha is estimated
+
+        // Verify the project hover report too
+        let report = get_project_table_report(content).unwrap();
+        println!("Project table report with non-estimated:\n{}", report);
+        assert!(report.contains("`#project=ABSCP`"));
+        assert!(report.contains("`#project=Alpha`"));
+        assert!(report.contains("2h (40.0%)"));
+        assert!(report.contains("12.6d (60.0%)"));
     }
 
     #[test]
@@ -2208,6 +2767,120 @@ mod tests {
             "klog_path": "klog-custom"
         });
         assert_eq!(find_klog_path_recursively(&val_direct), Some("klog-custom".to_string()));
+    }
+
+    #[test]
+    fn test_parse_time_entry_line() {
+        let p1 = parse_time_entry_line("    8:15 - 8:30 #project=RT Cost analysis").unwrap();
+        assert!(p1.is_range);
+        assert_eq!(p1.start_time, "8:15");
+        assert_eq!(p1.end_time, Some("8:30"));
+        assert_eq!(p1.rest, "#project=RT Cost analysis");
+        assert!(!p1.has_leading_bracket);
+        assert!(!p1.has_trailing_bracket);
+
+        let p2 = parse_time_entry_line("    <10:00 - ?").unwrap();
+        assert!(p2.is_range);
+        assert_eq!(p2.start_time, "10:00");
+        assert_eq!(p2.end_time, Some("?"));
+        assert!(p2.has_leading_bracket);
+        assert!(!p2.has_trailing_bracket);
+
+        let p3 = parse_time_entry_line("    10:00 - 11:00> #tag").unwrap();
+        assert!(p3.is_range);
+        assert_eq!(p3.start_time, "10:00");
+        assert_eq!(p3.end_time, Some("11:00"));
+        assert!(!p3.has_leading_bracket);
+        assert!(p3.has_trailing_bracket);
+
+        let p4 = parse_time_entry_line("    1h30m #project=A").unwrap();
+        assert!(!p4.is_range);
+        assert_eq!(p4.duration, Some("1h30m"));
+        assert_eq!(p4.rest, "#project=A");
+
+        let p5 = parse_time_entry_line("    -45m!").unwrap();
+        assert!(!p5.is_range);
+        assert_eq!(p5.duration, Some("-45m!"));
+        assert_eq!(p5.rest, "");
+
+        assert!(parse_time_entry_line("  8:15 - 8:30").is_none());
+        assert!(parse_time_entry_line("     8:15 - 8:30").is_none());
+        assert!(parse_time_entry_line("    not a time entry").is_none());
+    }
+
+    #[test]
+    fn test_split_tags_and_description() {
+        let (t1, d1) = split_tags_and_description("#project=RT Cost analysis");
+        assert_eq!(t1, "#project=RT");
+        assert_eq!(d1, "Cost analysis");
+
+        let (t2, d2) = split_tags_and_description("#project=VORTEX#ticket=glpi-260 Deploy new resources");
+        assert_eq!(t2, "#project=VORTEX#ticket=glpi-260");
+        assert_eq!(d2, "Deploy new resources");
+
+        let (t3, d3) = split_tags_and_description("#tag1 #tag2   Some description");
+        assert_eq!(t3, "#tag1 #tag2");
+        assert_eq!(d3, "Some description");
+
+        let (t4, d4) = split_tags_and_description("No tags here");
+        assert_eq!(t4, "");
+        assert_eq!(d4, "No tags here");
+    }
+
+    #[test]
+    fn test_align_klog_content() {
+        let input = "\
+2026-05-21 (7h42m!) | Total: 6h | Should: 1d! | Diff: -1h42m
+    8:15 - 8:30 #project=RT Cost analysis
+    10:00 - 10:40 #project=VORTEX#ticket=glpi-260 Fix deployment issues
+    11:45 - 12:15 #project=VORTEX Project cleanup and push changes
+    14:00 - 15:00 #project=SINCRONE#lot=2-5 COSUI
+    1h30m #project=RT Duration entry
+    45m
+";
+        let expected = "\
+2026-05-21 (7h42m!) | Total: 6h | Should: 1d! | Diff: -1h42m
+    8:15 - 8:30     #project=RT                      Cost analysis
+    10:00 - 10:40   #project=VORTEX#ticket=glpi-260  Fix deployment issues
+    11:45 - 12:15   #project=VORTEX                  Project cleanup and push changes
+    14:00 - 15:00   #project=SINCRONE#lot=2-5        COSUI
+    1h30m           #project=RT                      Duration entry
+    45m
+";
+        let result = align_klog_content(input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_get_folding_ranges() {
+        let content = "\
+2026-05-21 (8h!)
+    8:15 - 8:30 #project=RT
+        Cost analysis
+        details here
+
+    10:00 - 10:40 #project=VORTEX
+
+2026-05-22
+    9:00 - 10:00
+";
+        let ranges = get_folding_ranges(content);
+        assert_eq!(ranges.len(), 3);
+        assert!(ranges.contains(&FoldingRange {
+            start_line: 0,
+            end_line: 5,
+            kind: Some("region".to_string()),
+        }));
+        assert!(ranges.contains(&FoldingRange {
+            start_line: 1,
+            end_line: 3,
+            kind: Some("region".to_string()),
+        }));
+        assert!(ranges.contains(&FoldingRange {
+            start_line: 7,
+            end_line: 8,
+            kind: Some("region".to_string()),
+        }));
     }
 }
 

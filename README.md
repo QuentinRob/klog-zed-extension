@@ -24,6 +24,10 @@ Full syntax highlighting for `.klog` and `.klg` files powered by the [tree-sitte
 
 The outline panel (`⌘⇧O`) lists all date records as navigable symbols, making it easy to jump between days in large files.
 
+### Editor Folding Support
+
+Collapse/fold day records and time entry continuation blocks directly in the editor. Folding is supported natively via Tree-sitter folding queries (`folds.scm`) as well as the LSP (`textDocument/foldingRange`) provider.
+
 ### Snippets
 
 | Prefix | Expands to |
@@ -73,19 +77,25 @@ Hover over any element to get an instant report powered by the `klog` CLI:
 
 ### Inline Project Breakdown (Code Lens / Inlay Hints)
 
-When your file contains `#project=Value` tags, an inline breakdown appears at the very top of the file showing total time per project alongside an end-of-month projection — no need to open a terminal:
+When your file contains `#project=Value` tags, an inline breakdown appears at the very top of the file showing total time per project, percentage contribution, and an end-of-month projection:
 
 ```
-Project        │ Total │ Est. End
-───────────────┼───────┼──────────
-#project=Alpha │ 1h30m │ 2h19m
-#project=Beta  │ 3h30m │ 5h25m
-───────────────┼───────┼──────────
-Total          │ 5h    │ 7h45m
+Project        │ Total          │ Est. End
+───────────────┼────────────────┼────────────────
+#project=Alpha │ 2h     (40.0%) │ 12.6d  (60.0%)
+#project=Beta  │ 3h     (60.0%) │ 18.9d  (90.0%)
+───────────────┼────────────────┼────────────────
+Total          │ 5h     (100.0%)│ 31.5d  (150.0%)
 ```
+
+Both the CodeLens and Hover project reports display each project's percentage contribution relative to the total tracked time, vertically aligned by their parentheses `(` for neat readability.
 
 The `Est. End` projection for projects is automatically calculated by scaling the tracked time for the current month by the ratio of total days in the month to the day of the latest record:
 $$\text{Estimated Project Total} = \text{Total So Far} \times \frac{T_{\text{total}}}{D_{\text{latest}}}$$
+
+#### Project Estimation Exemptions
+Specific project tags (`ABSCP`, `RTTE`, `RTTS`, `ABSConv`, and `ABSMal`) are kept at their actual tracked value in the `Est. End` projection column instead of being projected by the monthly ratio.
+
 The estimated grand total for the month, however, is calculated as the number of working days in that month multiplied by the configured day duration:
 $$\text{Estimated Grand Total} = \text{Working Days} \times \text{day\_duration}$$
 Values equal to or exceeding the configured day duration (default `7h42m`) are converted to days (e.g. `1d` for `7h42m`).
@@ -274,7 +284,7 @@ By default, the LSP will search for a `klog` executable in your `$PATH`. If your
 ### Document Formatting & Code Actions
 
 This extension supports built-in formatting, diagnostics, and quick-fix code actions:
-- **Format Document**: Runs `klog print` on your file to keep indentation and structures clean and aligned. You can trigger this manually (`⌘⇧I` or format document command) or enable format-on-save in Zed.
+- **Format Document**: Runs `klog print` on your file to keep structures clean and aligned. To prevent indentation/syntax errors, all time entries are formatted with exactly **4 spaces of indentation** (e.g., `    8:15 - 8:30` instead of `     8:15 - 8:30` for single digit hours), and project tags/descriptions are aligned to consistent columns. You can trigger this manually (`⌘⇧I` or format document command) or enable format-on-save in Zed.
 - **Diagnostics**: Real-time syntax errors and logical warnings from `klog json` are displayed inline as editor diagnostics.
 - **Start/Stop Timer Code Actions**:
   - **Start open-ended time entry at [current_time]**: Offered when your cursor is inside a record. It appends a new open-ended time entry `    HH:MM - ?` at the current time.
