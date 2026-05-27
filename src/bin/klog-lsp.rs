@@ -202,6 +202,14 @@ struct HoverParams {
 }
 
 #[derive(Deserialize, Debug)]
+struct CompletionParams {
+    #[serde(rename = "textDocument")]
+    text_document: TextDocumentIdentifier,
+    position: Position,
+}
+
+
+#[derive(Deserialize, Debug)]
 struct TextDocumentIdentifier {
     uri: String,
 }
@@ -343,10 +351,11 @@ struct TextEdit {
 }
 
 fn log_msg(msg: &str) {
+    let path = std::env::temp_dir().join("klog-lsp.log");
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/klog-lsp.log")
+        .open(path)
     {
         let _ = writeln!(file, "{}", msg);
     }
@@ -419,15 +428,32 @@ fn send_notification<W: Write>(
 }
 
 
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
 struct KlogJsonOutput {
-    records: Option<serde_json::Value>,
+    records: Option<Vec<KlogRecord>>,
     warnings: Option<Vec<String>>,
     errors: Option<Vec<KlogJsonError>>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
+#[allow(dead_code)]
+struct KlogRecord {
+    date: String,
+    #[serde(default)]
+    total: String,
+    #[serde(default)]
+    total_mins: i32,
+    #[serde(default)]
+    should_total: String,
+    #[serde(default)]
+    should_total_mins: i32,
+    #[serde(default)]
+    diff: String,
+    #[serde(default)]
+    diff_mins: i32,
+}
+
+#[derive(Deserialize, Debug, Clone)]
 struct KlogJsonError {
     line: usize,
     column: usize,
@@ -436,65 +462,146 @@ struct KlogJsonError {
     details: String,
 }
 
-fn publish_diagnostics<W: Write>(uri: &str, content: &str, writer: &mut W) {
+/// In-memory cache for a parsed klog document.
+/// Stores pre-parsed JSON records, project breakdown reports,
+/// warnings, and errors to prevent costly repetitive klog CLI processes.
+#[derive(Debug, Clone)]
+struct DocumentCache {
+    content: String,
+    records: Vec<KlogRecord>,
+    warnings: Vec<String>,
+    errors: Vec<KlogJsonError>,
+    project_breakdown: Option<String>,
+    project_table_report: Option<String>,
+}
+
+/// Formats a single-line summary representing the tracked duration, target should-total,
+/// and difference for a record to display as inlay hints or inline code lens summaries.
+fn get_day_summary_inline_from_record(record: &KlogRecord) -> String {
+    let mut parts = vec![format!("Total: {}", convert_duration_string(&record.total))];
+    let should_str = if record.should_total == "0m" {
+        "0m!".to_string()
+    } else {
+        record.should_total.clone()
+    };
+    parts.push(format!("Should: {}", convert_duration_string(&should_str)));
+    parts.push(format!("Diff: {}", convert_duration_string(&record.diff)));
+    parts.join("  │  ")
+}
+
+/// Formats a detailed markdown day report table displaying total, should-total,
+/// and difference metrics for the hover preview.
+fn get_day_report_from_record(record: &KlogRecord) -> String {
+    let mut table = format!("### Day Report: {}\n\n", record.date);
+    table.push_str("| Metric | Value |\n");
+    table.push_str("| :--- | :--- |\n");
+    table.push_str(&format!("| **Total** | **{}** |\n", convert_duration_string(&record.total)));
+    let should_str = if record.should_total == "0m" {
+        "0m!".to_string()
+    } else {
+        record.should_total.clone()
+    };
+    table.push_str(&format!("| Should | {} |\n", convert_duration_string(&should_str)));
+    table.push_str(&format!("| Diff | {} |\n", convert_duration_string(&record.diff)));
+    table
+}
+
+/// Parses the klog document content by calling the klog CLI `json` command
+/// and pre-calculates the project breakdowns, error lists, and warnings.
+/// Stores the results in the documents cache.
+fn update_document_cache(
+    uri: &str,
+    content: String,
+    cache: &mut HashMap<String, DocumentCache>,
+) {
+    let mut records = Vec::new();
+    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
+
+    if let Some(json_str) = run_klog_command_raw(&["json"], &content) {
+        if let Ok(output) = serde_json::from_str::<KlogJsonOutput>(&json_str) {
+            if let Some(rec) = output.records {
+                records = rec;
+            }
+            if let Some(warn) = output.warnings {
+                warnings = warn;
+            }
+            if let Some(err) = output.errors {
+                errors = err;
+            }
+        } else {
+            log_msg("Failed to parse klog json output");
+        }
+    } else {
+        log_msg("Failed to execute klog command");
+    }
+
+    let project_breakdown = get_project_breakdown(&content);
+    let project_table_report = get_project_table_report(&content);
+
+    cache.insert(
+        uri.to_string(),
+        DocumentCache {
+            content,
+            records,
+            warnings,
+            errors,
+            project_breakdown,
+            project_table_report,
+        },
+    );
+}
+
+fn publish_diagnostics<W: Write>(uri: &str, cache_entry: &DocumentCache, writer: &mut W) {
     let mut diagnostics = Vec::new();
 
-    // Call klog json on content
-    if let Some(json_str) = run_klog_command_raw(&["json"], content) {
-        if let Ok(output) = serde_json::from_str::<KlogJsonOutput>(&json_str) {
-            // Process errors
-            if let Some(errors) = output.errors {
-                for err in errors {
-                    let line_0 = err.line.saturating_sub(1) as u32;
-                    let col_0 = err.column.saturating_sub(1) as u32;
-                    let length = err.length as u32;
+    // Process errors
+    for err in &cache_entry.errors {
+        let line_0 = err.line.saturating_sub(1) as u32;
+        let col_0 = err.column.saturating_sub(1) as u32;
+        let length = err.length as u32;
 
-                    diagnostics.push(serde_json::json!({
-                        "range": {
-                            "start": { "line": line_0, "character": col_0 },
-                            "end": { "line": line_0, "character": col_0 + length }
-                        },
-                        "severity": 1, // Error
-                        "code": "klog-syntax",
-                        "source": "klog",
-                        "message": format!("{}: {}", err.title, err.details)
-                    }));
-                }
-            }
+        diagnostics.push(serde_json::json!({
+            "range": {
+                "start": { "line": line_0, "character": col_0 },
+                "end": { "line": line_0, "character": col_0 + length }
+            },
+            "severity": 1, // Error
+            "code": "klog-syntax",
+            "source": "klog",
+            "message": format!("{}: {}", err.title, err.details)
+        }));
+    }
 
-            // Process warnings
-            if let Some(warnings) = output.warnings {
-                for warn in warnings {
-                    let parts: Vec<&str> = warn.splitn(2, ':').collect();
-                    let mut matched_line = None;
-                    if parts.len() == 2 {
-                        let prefix = parts[0].trim();
-                        if !prefix.is_empty() {
-                            for (idx, line) in content.lines().enumerate() {
-                                if line.contains(prefix) {
-                                    matched_line = Some(idx);
-                                    break;
-                                }
-                            }
-                        }
+    // Process warnings
+    for warn in &cache_entry.warnings {
+        let parts: Vec<&str> = warn.splitn(2, ':').collect();
+        let mut matched_line = None;
+        if parts.len() == 2 {
+            let prefix = parts[0].trim();
+            if !prefix.is_empty() {
+                for (idx, line) in cache_entry.content.lines().enumerate() {
+                    if is_date_line(line) && line.contains(prefix) {
+                        matched_line = Some(idx);
+                        break;
                     }
-
-                    let line_idx = matched_line.unwrap_or(0);
-                    let line_len = content.lines().nth(line_idx).map(|l| l.len()).unwrap_or(0);
-
-                    diagnostics.push(serde_json::json!({
-                        "range": {
-                            "start": { "line": line_idx as u32, "character": 0 },
-                            "end": { "line": line_idx as u32, "character": line_len as u32 }
-                        },
-                        "severity": 2, // Warning
-                        "code": "klog-warning",
-                        "source": "klog",
-                        "message": warn.clone()
-                    }));
                 }
             }
         }
+
+        let line_idx = matched_line.unwrap_or(0);
+        let line_len = cache_entry.content.lines().nth(line_idx).map(|l| l.len()).unwrap_or(0);
+
+        diagnostics.push(serde_json::json!({
+            "range": {
+                "start": { "line": line_idx as u32, "character": 0 },
+                "end": { "line": line_idx as u32, "character": line_len as u32 }
+            },
+            "severity": 2, // Warning
+            "code": "klog-warning",
+            "source": "klog",
+            "message": warn.clone()
+        }));
     }
 
     let params = serde_json::json!({
@@ -849,7 +956,33 @@ fn get_code_actions(
     actions
 }
 
-fn get_completions(date_str: &str, time_str: &str, content: Option<&str>) -> serde_json::Value {
+/// Finds the starting index of a word (e.g. tag or date/timespan template)
+/// at the given character index on the line by moving backward until a whitespace is encountered.
+fn find_word_start(line: &str, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let mut start = char_idx;
+    while start > 0 {
+        let prev_char = chars[start - 1];
+        if prev_char.is_whitespace() {
+            break;
+        }
+        start -= 1;
+    }
+    start
+}
+
+/// Returns a JSON value containing completion items for snippets, timestamps, and tags.
+/// If `position` is provided, generates a `textEdit` replacement instead of `insertText`
+/// to prevent duplicate prefixes (like `#project=#project=toto`) when accepting propositions.
+fn get_completions(
+    date_str: &str,
+    time_str: &str,
+    content: Option<&str>,
+    position: Option<Position>,
+) -> serde_json::Value {
     let hour = if time_str.len() >= 2 { &time_str[..2] } else { "00" };
     let mins = get_day_duration_minutes();
     let duration_str = format_minutes_to_duration(mins);
@@ -858,92 +991,62 @@ fn get_completions(date_str: &str, time_str: &str, content: Option<&str>) -> ser
     let date_snippet_prefilled = format!("${{1:{}}} (${{2:{}!}})", date_str, duration_str);
     let date_snippet_not_prefilled = format!("${{1:YYYY-MM-DD}} (${{2:{}!}})", duration_str);
 
-    let mut items = serde_json::json!([
-        {
-            "label": "today",
-            "insertText": date_snippet_prefilled,
-            "insertTextFormat": 2,
-            "kind": 15,
-            "detail": format!("Inserts today's date with configured day duration ({})", date_with_duration)
-        },
-        {
-            "label": "date",
-            "insertText": date_snippet_not_prefilled,
-            "insertTextFormat": 2,
-            "kind": 15,
-            "detail": format!("Inserts a date record template with configured day duration (YYYY-MM-DD ({}!))", duration_str)
-        },
-        {
-            "label": "20",
-            "insertText": date_snippet_prefilled,
-            "insertTextFormat": 2,
-            "kind": 15,
-            "detail": format!("Inserts today's date with configured day duration ({})", date_with_duration)
-        },
-        {
-            "label": date_str,
-            "insertText": date_snippet_prefilled,
-            "insertTextFormat": 2,
-            "kind": 15,
-            "detail": format!("Inserts today's date with configured day duration ({})", date_with_duration)
-        },
-        {
-            "label": "record",
-            "insertText": format!("${{1:{}}} (${{2:{}!}})\n${{3:Summary}}\n    $0", date_str, duration_str),
-            "insertTextFormat": 2,
-            "kind": 15,
-            "detail": "Creates a new record block with today's date and configured day duration"
-        },
-        {
-            "label": "time",
-            "insertText": time_str,
-            "kind": 15,
-            "detail": format!("Inserts current time ({})", time_str)
-        },
-        {
-            "label": "ts",
-            "insertText": format!("{}:${{1:00}} - {}:${{2:00}} $0", hour, hour),
-            "insertTextFormat": 2,
-            "kind": 15,
-            "detail": "Inserts a timespan starting at the current hour"
-        },
-        {
-            "label": "timespan",
-            "insertText": format!("{}:${{1:00}} - {}:${{2:00}} $0", hour, hour),
-            "insertTextFormat": 2,
-            "kind": 15,
-            "detail": "Inserts a timespan starting at the current hour"
-        },
-        {
-            "label": "tsoe",
-            "insertText": format!("{} - ? $0", time_str),
-            "insertTextFormat": 2,
-            "kind": 15,
-            "detail": "Inserts an open-ended timespan starting at the current time"
-        },
-        {
-            "label": "timespan-open-ended",
-            "insertText": format!("{} - ? $0", time_str),
-            "insertTextFormat": 2,
-            "kind": 15,
-            "detail": "Inserts an open-ended timespan starting at the current time"
-        }
-    ]);
+    let mut start_char = 0;
+    let mut has_position = false;
+    let mut line_num = 0;
 
-    if let Some(text) = content {
-        if let Some(arr) = items.as_array_mut() {
-            for tag in extract_tags(text) {
-                arr.push(serde_json::json!({
-                    "label": tag,
-                    "insertText": tag,
-                    "kind": 12,
-                    "detail": "Tag from document"
-                }));
+    if let Some(pos) = &position {
+        line_num = pos.line;
+        if let Some(text) = content {
+            if let Some(line) = text.lines().nth(pos.line as usize) {
+                start_char = find_word_start(line, pos.character as usize);
+                has_position = true;
             }
         }
     }
 
-    items
+    let make_item = |label: &str, insert_text: &str, kind: u32, detail: &str, is_snippet: bool| {
+        let mut item = serde_json::json!({
+            "label": label,
+            "kind": kind,
+            "detail": detail,
+        });
+        if is_snippet {
+            item["insertTextFormat"] = serde_json::json!(2);
+        }
+        if has_position {
+            item["textEdit"] = serde_json::json!({
+                "range": {
+                    "start": { "line": line_num, "character": start_char as u32 },
+                    "end": { "line": line_num, "character": position.as_ref().unwrap().character }
+                },
+                "newText": insert_text
+            });
+        } else {
+            item["insertText"] = serde_json::json!(insert_text);
+        }
+        item
+    };
+
+    let mut list = Vec::new();
+    list.push(make_item("today", &date_snippet_prefilled, 15, &format!("Inserts today's date with configured day duration ({})", date_with_duration), true));
+    list.push(make_item("date", &date_snippet_not_prefilled, 15, &format!("Inserts a date record template with configured day duration (YYYY-MM-DD ({}!))", duration_str), true));
+    list.push(make_item("20", &date_snippet_prefilled, 15, &format!("Inserts today's date with configured day duration ({})", date_with_duration), true));
+    list.push(make_item(date_str, &date_snippet_prefilled, 15, &format!("Inserts today's date with configured day duration ({})", date_with_duration), true));
+    list.push(make_item("record", &format!("${{1:{}}} (${{2:{}!}})\n${{3:Summary}}\n    $0", date_str, duration_str), 15, "Creates a new record block with today's date and configured day duration", true));
+    list.push(make_item("time", time_str, 15, &format!("Inserts current time ({})", time_str), false));
+    list.push(make_item("ts", &format!("{}:${{1:00}} - {}:${{2:00}} $0", hour, hour), 15, "Inserts a timespan starting at the current hour", true));
+    list.push(make_item("timespan", &format!("{}:${{1:00}} - {}:${{2:00}} $0", hour, hour), 15, "Inserts a timespan starting at the current hour", true));
+    list.push(make_item("tsoe", &format!("{} - ? $0", time_str), 15, "Inserts an open-ended timespan starting at the current time", true));
+    list.push(make_item("timespan-open-ended", &format!("{} - ? $0", time_str), 15, "Inserts an open-ended timespan starting at the current time", true));
+
+    if let Some(text) = content {
+        for tag in extract_tags(text) {
+            list.push(make_item(&tag, &tag, 12, "Tag from document", false));
+        }
+    }
+
+    serde_json::Value::Array(list)
 }
 
 /// Sakamoto's algorithm: returns 0 for Sunday, 1 for Monday, ..., 6 for Saturday.
@@ -1110,72 +1213,6 @@ fn format_minutes_to_duration(total_mins: i32) -> String {
 }
 
 
-fn run_klog_for_date(date: &str, content: &str) -> Option<String> {
-    let total_args = vec!["total", "--date", date, "--diff", "--no-style"];
-    let total_output = run_klog_command(&total_args, content)?;
-
-    let mut total_val = None;
-    let mut should_val = None;
-    let mut diff_val = None;
-
-    for line in total_output.lines() {
-        if let Some(v) = line.strip_prefix("Total:") {
-            total_val = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("Should:") {
-            should_val = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("Diff:") {
-            diff_val = Some(v.trim().to_string());
-        }
-    }
-
-    total_val.as_ref()?;
-
-    let mut table = format!("### Day Report: {}\n\n", date);
-    table.push_str("| Metric | Value |\n");
-    table.push_str("| :--- | :--- |\n");
-    if let Some(v) = &total_val {
-        table.push_str(&format!("| **Total** | **{}** |\n", convert_duration_string(v)));
-    }
-    if let Some(v) = &should_val {
-        table.push_str(&format!("| Should | {} |\n", convert_duration_string(v)));
-    }
-    if let Some(v) = &diff_val {
-        table.push_str(&format!("| Diff | {} |\n", convert_duration_string(v)));
-    }
-
-    Some(table)
-}
-
-/// Returns a compact single-line day summary for use in Code Lenses and Inlay Hints.
-/// Example: "Total: 6h  │  Should: 8h!  │  Diff: -2h"
-fn get_day_summary_inline(date: &str, content: &str) -> Option<String> {
-    let args = vec!["total", "--date", date, "--diff", "--no-style"];
-    let output = run_klog_command(&args, content)?;
-
-    let mut total_val = None;
-    let mut should_val = None;
-    let mut diff_val = None;
-
-    for line in output.lines() {
-        if let Some(v) = line.strip_prefix("Total:") {
-            total_val = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("Should:") {
-            should_val = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("Diff:") {
-            diff_val = Some(v.trim().to_string());
-        }
-    }
-
-    let total = total_val?;
-    let mut parts = vec![format!("Total: {}", convert_duration_string(&total))];
-    if let Some(s) = should_val {
-        parts.push(format!("Should: {}", convert_duration_string(&s)));
-    }
-    if let Some(d) = diff_val {
-        parts.push(format!("Diff: {}", convert_duration_string(&d)));
-    }
-    Some(format!("{}", parts.join("  │  ")))
-}
 
 fn run_klog_for_tag(tag: &str, content: &str) -> Option<String> {
     let total_args = vec!["total", "--tag", tag, "--no-style"];
@@ -1640,14 +1677,15 @@ fn get_project_table_report(content: &str) -> Option<String> {
 }
 
 fn main() {
-    let _ = std::fs::remove_file("/tmp/klog-lsp.log");
+    let log_path = std::env::temp_dir().join("klog-lsp.log");
+    let _ = std::fs::remove_file(log_path);
     log_msg("klog-lsp starting...");
 
     let stdin = io::stdin();
     let mut reader = io::BufReader::new(stdin.lock());
     let mut writer = io::stdout();
 
-    let mut documents: HashMap<String, String> = HashMap::new();
+    let mut documents_cache: HashMap<String, DocumentCache> = HashMap::new();
 
     while let Ok(Some(msg)) = read_message(&mut reader) {
         log_msg(&format!("Received message: {}", msg));
@@ -1710,28 +1748,29 @@ fn main() {
                             log_msg(&format!("Hover request for uri: {}, line: {}, char: {}", uri, line_idx, char_idx));
 
                             let mut hover_content = None;
-                            if let Some(content) = documents.get(&uri) {
-                                let lines: Vec<&str> = content.lines().collect();
+                            if let Some(cache_entry) = documents_cache.get(&uri) {
+                                let lines: Vec<&str> = cache_entry.content.lines().collect();
                                 if line_idx < lines.len() {
                                     let current_line = lines[line_idx];
 
                                     // 1. Check if hovering a tag
                                     if let Some(tag) = find_tag_under_cursor(current_line, char_idx) {
                                         log_msg(&format!("Hovering tag: {}", tag));
-                                        hover_content = run_klog_for_tag(&tag, content);
+                                        hover_content = run_klog_for_tag(&tag, &cache_entry.content);
                                     }
                                     // 2. Check if hovering the title (date line)
                                     else if is_date_line(current_line) {
-                                        if let Some(date) = find_date_for_line(content, line_idx) {
+                                        if let Some(date) = find_date_for_line(&cache_entry.content, line_idx) {
                                             log_msg(&format!("Hovering title/date: {}", date));
                                             let mut content_str = String::new();
-                                            if let Some(day_report) = run_klog_for_date(&date, content) {
+                                            if let Some(record) = cache_entry.records.iter().find(|r| r.date == date) {
+                                                let day_report = get_day_report_from_record(record);
                                                 content_str.push_str(&day_report);
                                                 content_str.push_str("\n---\n");
                                             }
                                             if line_idx == 0 {
-                                                if let Some(project_report) = get_project_table_report(content) {
-                                                    content_str.push_str(&project_report);
+                                                if let Some(ref project_report) = cache_entry.project_table_report {
+                                                    content_str.push_str(project_report);
                                                 }
                                             }
                                             if !content_str.is_empty() {
@@ -1773,9 +1812,9 @@ fn main() {
                             let uri = lens_params.text_document.uri;
                             let mut lenses = Vec::new();
 
-                            if let Some(content) = documents.get(&uri) {
+                            if let Some(cache_entry) = documents_cache.get(&uri) {
                                 // Project breakdown at line 0 with 1 trailing blank line
-                                if let Some(breakdown) = get_project_breakdown(content) {
+                                if let Some(ref breakdown) = cache_entry.project_breakdown {
                                     lenses.push(CodeLens {
                                         range: Range {
                                             start: Position { line: 0, character: 0 },
@@ -1789,13 +1828,14 @@ fn main() {
                                 }
 
                                 // One compact day summary below each date line
-                                let total_lines = content.lines().count();
-                                for (idx, line) in content.lines().enumerate() {
+                                let total_lines = cache_entry.content.lines().count();
+                                for (idx, line) in cache_entry.content.lines().enumerate() {
                                     if is_date_line(line) {
                                         if let Some(date) = line.trim_start().split_whitespace().next() {
                                             let clean = date.trim_matches(|c: char| !c.is_ascii_digit() && c != '-' && c != '/');
                                             if clean.len() >= 10 {
-                                                if let Some(summary) = get_day_summary_inline(clean, content) {
+                                                if let Some(record) = cache_entry.records.iter().find(|r| r.date == clean) {
+                                                    let summary = get_day_summary_inline_from_record(record);
                                                     let target_line = if idx + 1 < total_lines { idx + 1 } else { idx };
                                                     lenses.push(CodeLens {
                                                         range: Range {
@@ -1832,9 +1872,9 @@ fn main() {
                             let uri = hint_params.text_document.uri;
                             let mut hints = Vec::new();
 
-                            if let Some(content) = documents.get(&uri) {
+                            if let Some(cache_entry) = documents_cache.get(&uri) {
                                 // Project breakdown at line 0 with 1 trailing blank line
-                                if let Some(breakdown) = get_project_breakdown(content) {
+                                if let Some(ref breakdown) = cache_entry.project_breakdown {
                                     hints.push(InlayHint {
                                         position: Position { line: 0, character: 0 },
                                         label: format!("{}\n", breakdown),
@@ -1845,12 +1885,13 @@ fn main() {
                                 }
 
                                 // One compact day summary at the end of each date line
-                                for (idx, line) in content.lines().enumerate() {
+                                for (idx, line) in cache_entry.content.lines().enumerate() {
                                     if is_date_line(line) {
                                         if let Some(date) = line.trim_start().split_whitespace().next() {
                                             let clean = date.trim_matches(|c: char| !c.is_ascii_digit() && c != '-' && c != '/');
                                             if clean.len() >= 10 {
-                                                if let Some(summary) = get_day_summary_inline(clean, content) {
+                                                if let Some(record) = cache_entry.records.iter().find(|r| r.date == clean) {
+                                                    let summary = get_day_summary_inline_from_record(record);
                                                     hints.push(InlayHint {
                                                         position: Position {
                                                             line: idx as u32,
@@ -1883,20 +1924,21 @@ fn main() {
                     log_msg("Handling textDocument/completion");
                     
                     let mut doc_content: Option<String> = None;
+                    let mut position: Option<Position> = None;
                     if let Some(ref params) = req.params {
-                        if let Some(uri_val) = params.get("textDocument").and_then(|td| td.get("uri")) {
-                            if let Some(uri_str) = uri_val.as_str() {
-                                if let Some(content) = documents.get(uri_str) {
-                                    doc_content = Some(content.clone());
-                                }
+                        if let Ok(comp_params) = serde_json::from_value::<CompletionParams>(params.clone()) {
+                            let uri_str = &comp_params.text_document.uri;
+                            if let Some(cache_entry) = documents_cache.get(uri_str) {
+                                doc_content = Some(cache_entry.content.clone());
                             }
+                            position = Some(comp_params.position);
                         }
                     }
 
                     let date_str = get_current_date().unwrap_or_else(|| "2026-05-21".to_string());
                     let time_str = get_current_time().unwrap_or_else(|| "09:00".to_string());
 
-                    let completions = get_completions(&date_str, &time_str, doc_content.as_deref());
+                    let completions = get_completions(&date_str, &time_str, doc_content.as_deref(), position);
 
                     send_response(
                         &mut writer,
@@ -1912,14 +1954,14 @@ fn main() {
                     if let Some(ref params) = req.params {
                         if let Some(uri_val) = params.get("textDocument").and_then(|td| td.get("uri")) {
                             if let Some(uri_str) = uri_val.as_str() {
-                                if let Some(content) = documents.get(uri_str) {
+                                if let Some(cache_entry) = documents_cache.get(uri_str) {
                                     // Run klog print --no-style --no-warn to format the document
-                                    if let Some(formatted) = run_klog_command_raw(&["print", "--no-style", "--no-warn"], content) {
+                                    if let Some(formatted) = run_klog_command_raw(&["print", "--no-style", "--no-warn"], &cache_entry.content) {
                                         let aligned = align_klog_content(&formatted);
                                         let mut final_text = aligned.trim_end().to_string();
                                         final_text.push('\n');
 
-                                        let split_lines: Vec<&str> = content.split('\n').collect();
+                                        let split_lines: Vec<&str> = cache_entry.content.split('\n').collect();
                                         let end_line = split_lines.len().saturating_sub(1);
                                         let end_char = split_lines.last().map(|l| l.len()).unwrap_or(0);
 
@@ -1954,8 +1996,8 @@ fn main() {
                             serde_json::from_value::<FoldingRangeParams>(params.clone())
                         {
                             let uri_str = &folding_params.text_document.uri;
-                            if let Some(content) = documents.get(uri_str) {
-                                let ranges = get_folding_ranges(content);
+                            if let Some(cache_entry) = documents_cache.get(uri_str) {
+                                let ranges = get_folding_ranges(&cache_entry.content);
                                 folding_ranges = serde_json::to_value(ranges).unwrap_or(serde_json::json!([]));
                             }
                         } else {
@@ -1979,10 +2021,10 @@ fn main() {
                             serde_json::from_value::<CodeActionParams>(params.clone())
                         {
                             let uri_str = &code_action_params.text_document.uri;
-                            if let Some(content) = documents.get(uri_str) {
+                            if let Some(cache_entry) = documents_cache.get(uri_str) {
                                 let actions_list = get_code_actions(
                                     uri_str,
-                                    content,
+                                    &cache_entry.content,
                                     code_action_params.range,
                                 );
                                 actions = serde_json::to_value(actions_list).unwrap_or(serde_json::json!([]));
@@ -2034,8 +2076,15 @@ fn main() {
                             }
                         }
                         // Re-validate all documents
-                        for (uri, content) in &documents {
-                            publish_diagnostics(uri, content, &mut writer);
+                        let uris: Vec<String> = documents_cache.keys().cloned().collect();
+                        for uri in uris {
+                            if let Some(entry) = documents_cache.get(&uri) {
+                                let content = entry.content.clone();
+                                update_document_cache(&uri, content, &mut documents_cache);
+                            }
+                            if let Some(entry) = documents_cache.get(&uri) {
+                                publish_diagnostics(&uri, entry, &mut writer);
+                            }
                         }
                     }
                 }
@@ -2045,15 +2094,18 @@ fn main() {
                             serde_json::from_value::<DidOpenTextDocumentParams>(params)
                         {
                             log_msg(&format!("Opened document: {}", open_params.text_document.uri));
-                            documents.insert(
-                                open_params.text_document.uri.clone(),
-                                open_params.text_document.text.clone(),
-                            );
-                            publish_diagnostics(
+                            update_document_cache(
                                 &open_params.text_document.uri,
-                                &open_params.text_document.text,
-                                &mut writer,
+                                open_params.text_document.text,
+                                &mut documents_cache,
                             );
+                            if let Some(entry) = documents_cache.get(&open_params.text_document.uri) {
+                                publish_diagnostics(
+                                    &open_params.text_document.uri,
+                                    entry,
+                                    &mut writer,
+                                );
+                            }
                         } else {
                             log_msg("Failed to parse DidOpenTextDocumentParams");
                         }
@@ -2066,15 +2118,18 @@ fn main() {
                         {
                             log_msg(&format!("Changed document: {}", change_params.text_document.uri));
                             if let Some(change) = change_params.content_changes.first() {
-                                documents.insert(
-                                    change_params.text_document.uri.clone(),
-                                    change.text.clone(),
-                                );
-                                publish_diagnostics(
+                                update_document_cache(
                                     &change_params.text_document.uri,
-                                    &change.text,
-                                    &mut writer,
+                                    change.text.clone(),
+                                    &mut documents_cache,
                                 );
+                                if let Some(entry) = documents_cache.get(&change_params.text_document.uri) {
+                                    publish_diagnostics(
+                                        &change_params.text_document.uri,
+                                        entry,
+                                        &mut writer,
+                                    );
+                                }
                             }
                         } else {
                             log_msg("Failed to parse DidChangeTextDocumentParams");
@@ -2087,7 +2142,7 @@ fn main() {
                             serde_json::from_value::<DidCloseTextDocumentParams>(params)
                         {
                             log_msg(&format!("Closed document: {}", close_params.text_document.uri));
-                            documents.remove(&close_params.text_document.uri);
+                            documents_cache.remove(&close_params.text_document.uri);
                             let clear_params = serde_json::json!({
                                 "uri": close_params.text_document.uri,
                                 "diagnostics": []
@@ -2671,7 +2726,7 @@ mod tests {
     fn test_get_completions() {
         // Test with default day duration (7h42m = 462 mins)
         DAY_DURATION_MINUTES.store(462, std::sync::atomic::Ordering::Relaxed);
-        let completions_default = get_completions("2026-05-21", "10:14", None);
+        let completions_default = get_completions("2026-05-21", "10:14", None, None);
         let list_default = completions_default.as_array().expect("completions should be a list");
         
         let find_insert_text = |list: &[serde_json::Value], lbl: &str| -> String {
@@ -2690,7 +2745,7 @@ mod tests {
 
         // Test with custom day duration (8h = 480 mins)
         DAY_DURATION_MINUTES.store(480, std::sync::atomic::Ordering::Relaxed);
-        let completions_8h = get_completions("2026-05-21", "10:14", None);
+        let completions_8h = get_completions("2026-05-21", "10:14", None, None);
         let list_8h = completions_8h.as_array().expect("completions should be a list");
 
         assert_eq!(find_insert_text(list_8h, "today"), "${1:2026-05-21} (${2:8h!})");
@@ -2698,6 +2753,25 @@ mod tests {
         assert_eq!(find_insert_text(list_8h, "20"), "${1:2026-05-21} (${2:8h!})");
         assert_eq!(find_insert_text(list_8h, "2026-05-21"), "${1:2026-05-21} (${2:8h!})");
         assert_eq!(find_insert_text(list_8h, "record"), "${1:2026-05-21} (${2:8h!})\n${3:Summary}\n    $0");
+
+        // Test with tag completion and position
+        let content = "2026-05-21 (8h!)\n    #project=foo #project=bar\n";
+        let pos = Position { line: 1, character: 13 }; // right after "#project="
+        let completions_with_pos = get_completions("2026-05-21", "10:14", Some(content), Some(pos));
+        let list_with_pos = completions_with_pos.as_array().expect("completions should be a list");
+        
+        let find_text_edit = |list: &[serde_json::Value], lbl: &str| -> Option<serde_json::Value> {
+            list.iter()
+                .find(|item| item["label"].as_str().unwrap() == lbl)
+                .and_then(|item| item.get("textEdit").cloned())
+        };
+
+        let edit = find_text_edit(list_with_pos, "#project=foo").expect("should have textEdit for #project=foo");
+        assert_eq!(edit["range"]["start"]["line"], 1);
+        assert_eq!(edit["range"]["start"]["character"], 4);
+        assert_eq!(edit["range"]["end"]["line"], 1);
+        assert_eq!(edit["range"]["end"]["character"], 13);
+        assert_eq!(edit["newText"], "#project=foo");
     }
 
     #[test]
@@ -2881,6 +2955,39 @@ mod tests {
             end_line: 8,
             kind: Some("region".to_string()),
         }));
+    }
+
+    #[test]
+    fn test_document_cache_update_and_summary() {
+        DAY_DURATION_MINUTES.store(600, std::sync::atomic::Ordering::Relaxed);
+        let content = "2026-05-20 (8h!)\n    9:00 - 11:00 #project=Alpha\n    11:00 - 14:00 #project=Beta\n";
+        let uri = "file:///test.klg";
+        let mut cache = HashMap::new();
+        
+        update_document_cache(uri, content.to_string(), &mut cache);
+        
+        assert!(cache.contains_key(uri));
+        let entry = cache.get(uri).unwrap();
+        assert_eq!(entry.content, content);
+        assert_eq!(entry.records.len(), 1);
+        
+        let record = &entry.records[0];
+        assert_eq!(record.date, "2026-05-20");
+        assert_eq!(record.total, "5h");
+        assert_eq!(record.should_total, "8h!");
+        assert_eq!(record.diff, "-3h");
+        
+        let summary = get_day_summary_inline_from_record(record);
+        assert!(
+            summary == "Total: 5h  │  Should: 8h!  │  Diff: -3h"
+                || summary == "Total: 5h  │  Should: 1.04d!  │  Diff: -3h"
+        );
+        
+        let report = get_day_report_from_record(record);
+        assert!(report.contains("### Day Report: 2026-05-20"));
+        assert!(report.contains("| **Total** | **5h** |"));
+        assert!(report.contains("| Should | 8h! |") || report.contains("| Should | 1.04d! |"));
+        assert!(report.contains("| Diff | -3h |"));
     }
 }
 

@@ -19,6 +19,8 @@ Full syntax highlighting for `.klog` and `.klg` files powered by the [tree-sitte
 - Tags (`#project=Alpha`, `#coding`)
 - Comments (`# this is a comment`)
 - Record summaries
+- Time entry notes / descriptions (italicized with the default text color for high readability)
+
 
 ### Document Outline
 
@@ -302,7 +304,7 @@ This extension supports built-in formatting, diagnostics, and quick-fix code act
 | `snippets/klog.json` | JSON | Editor snippets |
 | `grammars/klog` | Git submodule | [tree-sitter-klog](https://github.com/Ansimorph/tree-sitter-klog) grammar |
 
-The LSP server (`klog-lsp`) is a **separate native binary** that runs on the host machine. It shells out to the `klog` CLI to compute reports and returns them as Markdown over the JSON-RPC protocol. The Zed Wasm extension acts purely as a thin launcher.
+The LSP server (`klog-lsp`) is a **separate native binary** that runs on the host machine. It uses an in-memory document cache system to store parsed records, errors, warnings, and project breakdown reports upon document edits, completely avoiding repetitive synchronous CLI command execution on keystrokes/queries. The Zed Wasm extension acts purely as a thin launcher.
 
 ---
 
@@ -324,7 +326,7 @@ cargo install --path .
 # ⌘⇧P → lsp: restart language server
 ```
 
-LSP logs are written to `/tmp/klog-lsp.log` for debugging.
+LSP logs are written to the standard OS temp directory (e.g. `/tmp/klog-lsp.log` on Linux/macOS or the user's Local AppData Temp directory on Windows) for debugging.
 
 ---
 

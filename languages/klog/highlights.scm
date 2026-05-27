@@ -13,4 +13,6 @@
 (tag_value) @string
 
 (record (summary) @string)
-(entry (summary) @comment)
+(entry (summary) @variable @markup.italic)
+
+
